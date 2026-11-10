@@ -1,0 +1,32 @@
+# Maintainer: Kernlux Development Labs <hello@kernlux.com>
+#
+# FILES ONLY. No install= scriptlet, no pacman hooks, no code generated at build time, no network at build or
+# install time. check() runs the app's own --self-test (no display needed) so a package cannot be built from a
+# source that fails its security assertions.
+pkgname=omarchy-store-desktop
+pkgver=1.1.3
+pkgrel=1
+pkgdesc="Omarchy Store desktop app — installs run in your own terminal, nothing runs as root"
+arch=('any')
+url="https://omarchystore.com"
+license=('MIT')
+depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'xdg-terminal-exec' 'hicolor-icon-theme')
+optdepends=('flatpak: for Flatpak listings')
+# Public source: https://codeberg.org/kernlux/omarchy-store-desktop (GitHub is only a mirror). The release asset is pinned by sha256.
+source=("$pkgname-$pkgver.tar.gz::https://codeberg.org/kernlux/omarchy-store-desktop/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')  # this copy travels inside the archive it would hash; pkg/PKGBUILD in the repo and on the AUR pin the real sum
+
+check() {
+  cd "$pkgname-$pkgver"
+  /usr/bin/python3 -I omarchy-store-desktop.py --self-test   # exactly how the launcher runs it: system interpreter, isolated mode
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm644 omarchy-store-desktop.py          "$pkgdir/usr/share/$pkgname/omarchy-store-desktop.py"
+  install -Dm755 data/omarchy-store-desktop        "$pkgdir/usr/bin/omarchy-store-desktop"
+  install -Dm644 data/com.omarchystore.Store.desktop "$pkgdir/usr/share/applications/com.omarchystore.Store.desktop"
+  install -Dm644 data/com.omarchystore.Store.png   "$pkgdir/usr/share/icons/hicolor/512x512/apps/com.omarchystore.Store.png"
+  install -Dm644 LICENSE                           "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md SECURITY.md          -t "$pkgdir/usr/share/doc/$pkgname/"
+}

@@ -1,0 +1,13 @@
+#!/usr/bin/bash
+# Launcher installed by the package to /usr/bin. Fixed shell, fixed interpreter run with -I (PYTHONPATH, PYTHON* variables
+# and the user's site-packages are ignored; the process otherwise trusts the user's own session environment, as any
+# desktop app does), fixed script path, arguments passed through untouched (the app only understands --self-test /
+# --probe / --snapshot).
+#
+# 1.1.2: on NVIDIA's proprietary driver WebKitGTK's DMA-BUF renderer paints only part of the window (stale tiles, clicks
+# land on the wrong control). Detected from a fixed kernel path; nothing user-supplied is read, and a value the user has
+# already set is kept.
+if [[ -e /proc/driver/nvidia/version && -z "${WEBKIT_DISABLE_DMABUF_RENDERER+x}" ]]; then
+  export WEBKIT_DISABLE_DMABUF_RENDERER=1
+fi
+exec /usr/bin/python3 -I /usr/share/omarchy-store-desktop/omarchy-store-desktop.py "$@"

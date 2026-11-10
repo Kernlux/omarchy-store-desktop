@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy Store
+Comment=The community app store for Omarchy Linux
+Exec=omarchy-store-desktop
+Icon=com.omarchystore.Store
+Terminal=false
+Categories=System;PackageManager;
+Keywords=apps;themes;store;omarchy;install;
+StartupWMClass=com.omarchystore.Store

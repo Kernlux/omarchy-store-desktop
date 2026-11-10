@@ -1,0 +1,19 @@
+pkgbase = omarchy-store-desktop
+	pkgdesc = Omarchy Store desktop app — installs run in your own terminal, nothing runs as root
+	pkgver = 1.1.3
+	pkgrel = 1
+	url = https://omarchystore.com
+	arch = any
+	license = MIT
+	depends = python
+	depends = python-gobject
+	depends = gtk4
+	depends = libadwaita
+	depends = webkitgtk-6.0
+	depends = xdg-terminal-exec
+	depends = hicolor-icon-theme
+	optdepends = flatpak: for Flatpak listings
+	source = omarchy-store-desktop-1.1.2.tar.gz
+	sha256sums = d76d12d408d455732eb9df1baa2cab131bce0d279c1c911d96556c34c8c6860e
+
+pkgname = omarchy-store-desktop
