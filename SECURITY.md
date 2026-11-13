@@ -9,7 +9,8 @@ No sudo, pkexec, doas, polkit, setuid, sudoers, helper daemon, systemd unit, pac
 anywhere in the tree. `--self-test` audits the program's own syntax tree and compiled constants and fails if any of the
 tokens `sudo pkexec doas run0 polkit NOPASSWD sudoers systemd systemctl setuid setgid` appears in a code string, bytes or
 f-string of the app body; if any `shell=` keyword, `eval`/`exec`/`compile`/`getattr`/`__import__`, `os.system`/`exec*`/
-`spawn*`/`fork`/`set*id`, `GLib.spawn_*`, `Gio.Subprocess`/`AppInfo`, socket, ctypes or pty is referenced; if there is
+`spawn*`/`fork`/`set*id`, `GLib.spawn_*`, `Gio.Subprocess`/`AppInfo`, ctypes or pty is referenced; if `socket` is used
+anywhere but `hypr_ask` (1.1.4: one AF_UNIX stream to the user's own Hyprland, see below); if there is
 more than one process launcher or more than one network request; if an import is aliased or outside the allow-list; or
 if a fixed system path (`/bin /etc /usr /tmp /proc /home …`) appears. The no-hook / no-unit / no-scriptlet facts about
 the *tree* are asserted by `tests/`. WebKit's own HTTP-authentication dialog is refused too (`authenticate` → cancel): a
@@ -64,7 +65,18 @@ left to the owner.
   elsewhere — are governed by WebKit and the storefront's CSP, not by this app's navigation policy, which decides
   which *documents* may render. `<a ping>` hyperlink auditing cannot be switched off in WebKitGTK API 6.0 (the setting
   is a deprecated no-op; 1.1.1 no longer calls it): such pings are click-initiated subresource requests, like any image
-  the page loads. No telemetry, no update check: this program itself contacts only the store origin, for `catalog.json`.
+  the page loads. No telemetry: this program itself contacts only the store origin, for `catalog.json`.
+- App updates (1.1.4): no automatic download and no background check. When the window opens, or when the user picks
+  "Check for app update", the app reads `desktop_latest` from the catalog it already fetched; only `version`
+  (`N.N.N`) and `sha256` (64 hex) are used, a catalog-given URL is ignored. If the version is newer, the header shows
+  "Update to N.N.N". Pressing it opens the user's own terminal through the same confirm-with-Enter script as installs,
+  showing one line: `mkdir -p ~/Downloads && cd ~/Downloads && curl -fLO https://omarchystore.com/downloads/<file> &&
+  echo "<sha256>  <file>" | sha256sum -c && tar xf <file> && cd <dir> && ./install.sh`. The checksum is checked before
+  anything is unpacked; install.sh runs as the user and never uses root. Nothing happens until the user presses Enter.
+- Window control on Hyprland (1.1.4): `hypr_ask` talks to `$XDG_RUNTIME_DIR/hypr/<signature>/.socket.sock` (the
+  user's own compositor), reads the client list, and sends only four fixed requests about the window whose pid is this
+  process (maximize toggle, minimize to SnapDock's hidden workspace, bring back, focus); address and workspace are
+  pattern-checked first. Nothing from the page or the catalog reaches the compositor.
 - Proxies: Python and WebKit honour the session's proxy environment; an authenticating proxy (407) is a failed load,
   never a password prompt.
 
@@ -138,9 +150,9 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (83 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (95 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (174 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (175 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.

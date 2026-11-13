@@ -36,6 +36,7 @@ cp omarchy-store-desktop.py install.sh LICENSE README.md SECURITY.md "SECURITY-R
 cp tests/test_security.py "$d/tests/"
 printf 'version=%s\nsource_date_epoch=%s\n' "$V" "$SOURCE_DATE_EPOCH" > "$d/RELEASE-INFO"   # the one generated file: how to rebuild these bytes
 cp data/com.omarchystore.Store.desktop data/com.omarchystore.Store.png data/omarchy-store-desktop "$d/data/"
+cp data/lockup.png "$d/data/"; mkdir -p "$d/data/icons"; cp data/icons/48.png data/icons/64.png data/icons/128.png data/icons/256.png "$d/data/icons/"
 # The PKGBUILD copy inside the archive cannot contain the archive's own hash; mark it and say where the real one is.
 sed "s|^sha256sums=.*|sha256sums=('SKIP')  # this copy travels inside the archive it would hash; pkg/PKGBUILD in the repo and on the AUR pin the real sum|" pkg/PKGBUILD > "$d/pkg/PKGBUILD"
 find "$d" -type f -exec chmod 0644 {} +

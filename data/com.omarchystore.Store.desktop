@@ -6,5 +6,19 @@ Exec=omarchy-store-desktop
 Icon=com.omarchystore.Store
 Terminal=false
 Categories=System;PackageManager;
-Keywords=apps;themes;store;omarchy;install;
+Keywords=apps;themes;store;omarchy;install;updates;
+StartupNotify=true
 StartupWMClass=com.omarchystore.Store
+Actions=updates;update-all;installed;
+
+[Desktop Action updates]
+Name=Check for updates
+Exec=omarchy-store-desktop --updates
+
+[Desktop Action update-all]
+Name=Update all
+Exec=omarchy-store-desktop --update-all
+
+[Desktop Action installed]
+Name=Installed apps
+Exec=omarchy-store-desktop --installed

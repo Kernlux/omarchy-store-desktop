@@ -280,7 +280,8 @@ EVASIONS = {   # each is inserted at module level (after the imports) of a COPY 
     "extra-gi-namespace": 'from gi.repository import Soup',
     "eval-name": '_e = eval',
     "pathlib": 'import pathlib',
-    "socket": 'import socket',
+    "socket": 'import socket; socket.create_connection(("example.com", 80))',   # 1.1.4: socket is allowed only inside hypr_ask, AF_UNIX
+    "socket_unix_elsewhere": 's2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)',
     "docstring-readback": 'def _h():\n    "sudo -n true"\n_s3 = _h.__doc__',
     "nested-self-test-method": 'class _K:\n    def self_test(self):\n        return "su" + "do"',
     "open-other-path": '_fh2 = open(__file__, "rb")',

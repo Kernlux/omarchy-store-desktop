@@ -22,16 +22,21 @@ SECURITY MODEL — read this before changing anything:
     never show a password, prompt() or file-chooser dialog inside this window.
   * It writes only under $XDG_CONFIG_HOME/omarchy-store and $XDG_CACHE_HOME/omarchy-store (0700), plus the
     toolkit's own caches under $XDG_CACHE_HOME (GTK, WebKit, Mesa).
+  * Window control on Hyprland (1.1.4): Hyprland ignores a client's own maximize request and a dock may park a window on a
+    hidden "special" workspace. hypr_window() talks to the user's OWN compositor over its local socket, and only about
+    THIS process's window: it reads the client list, picks the window whose pid is ours, and sends one of two fixed
+    requests (maximize on/off, or bring it back to the current workspace). No free text reaches the compositor:
+    the address and workspace are checked against strict patterns first. Nothing else is ever sent.
   * `--self-test` proves the allow-list, the validation and the static audit of this file without a display and is
     run by the PKGBUILD's check(); tests/ cover the packaging and the no-hook facts.
 """
-import json, os, re, shlex, shutil, subprocess, sys, tempfile, urllib.parse, urllib.request
+import gzip, io, json, os, re, shlex, shutil, socket, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request
 import gi
 gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_version("WebKit", "6.0")
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -165,13 +170,176 @@ def input_is_fresh(last_input_us, now_us):
     return last_input_us is not None and 0 <= now_us - last_input_us <= INPUT_WINDOW_US
 
 
+VIEWS = ("updates", "update-all", "installed")   # --updates / --update-all / --installed (dock right-click menu)
+UPDATE_ORIGIN = "https://omarchystore.com"   # fixed: the app update is always fetched from the store itself, never from a catalog-given URL
+VER_RE = re.compile(r"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}")
+SHA_RE = re.compile(r"[0-9a-f]{64}")
+UPDATE_TAG = "__update_app__"                 # cannot match ARG_RE (leading "_"), so no catalog install can ever produce it
+
+
+def vtuple(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def app_update(latest):
+    """(version, sha256) of a NEWER app published in catalog.json's desktop_latest, or None. Only these two strings are
+    taken from the catalog, each checked against a strict pattern; the download URL is built by update_command."""
+    if not isinstance(latest, dict): return None
+    v, h = latest.get("version"), latest.get("sha256")
+    if not (isinstance(v, str) and VER_RE.fullmatch(v) and isinstance(h, str) and SHA_RE.fullmatch(h)): return None
+    return (v, h) if vtuple(v) > vtuple(VERSION) else None
+
+
+def update_command(v, h):
+    """The one chained line the user's terminal shows for an app update (the same box as /get-desktop/#update): download
+    from the store, check the SHA-256, unpack, run the package's own install.sh as the user. Nothing runs until Enter."""
+    if not (isinstance(v, str) and VER_RE.fullmatch(v) and isinstance(h, str) and SHA_RE.fullmatch(h)): raise ValueError("bad update")
+    f = f"omarchy-store-desktop-{v}.tar.gz"
+    return (f"mkdir -p ~/Downloads && cd ~/Downloads && curl -fLO {UPDATE_ORIGIN}/downloads/{f} && "
+            f"echo \"{h}  {f}\" | sha256sum -c && tar xf {f} && cd omarchy-store-desktop-{v} && ./install.sh")
+
+
+# ---- Updates (1.1.4): read-only, no processes, no network beyond the catalog ----
+PACMAN_DB = "/var/lib/pacman"   # the package database every Arch tool reads; opened read-only ("rb"), never written, never run
+MAX_DB = 64 << 20               # bound on one sync database (core/extra are a few MiB)
+
+
+def _rpmvercmp(a, b):
+    """libalpm rpmvercmp (lib/libalpm/version.c), ported line by line; ASCII rules like C's isalnum/isdigit/isalpha."""
+    if a == b: return 0
+    dig = lambda c: "0" <= c <= "9"
+    alp = lambda c: "a" <= c <= "z" or "A" <= c <= "Z"
+    one = p1 = 0; two = p2 = 0; la, lb = len(a), len(b)
+    while one < la and two < lb:
+        while one < la and not (dig(a[one]) or alp(a[one])): one += 1
+        while two < lb and not (dig(b[two]) or alp(b[two])): two += 1
+        if one >= la or two >= lb: break
+        if (one - p1) != (two - p2): return -1 if (one - p1) < (two - p2) else 1
+        p1, p2 = one, two
+        isnum = dig(a[p1])
+        while p1 < la and (dig(a[p1]) if isnum else alp(a[p1])): p1 += 1
+        while p2 < lb and (dig(b[p2]) if isnum else alp(b[p2])): p2 += 1
+        x, y = a[one:p1], b[two:p2]
+        if not x: return -1
+        if not y: return 1 if isnum else -1
+        if isnum:
+            x, y = x.lstrip("0"), y.lstrip("0")
+            if len(x) != len(y): return 1 if len(x) > len(y) else -1
+        if x != y: return -1 if x < y else 1
+        one, two = p1, p2
+    ra, rb = a[one:], b[two:]
+    if not ra and not rb: return 0
+    if (not ra and not (rb[:1] and alp(rb[0]))) or (ra[:1] and alp(ra[0])): return -1
+    return 1
+
+
+def vercmp(a, b):
+    """pacman's vercmp for [epoch:]version[-release] (checked against /usr/bin/vercmp in tests/)."""
+    if a == b: return 0
+    def evr(v):
+        i = 0
+        while i < len(v) and "0" <= v[i] <= "9": i += 1
+        e, rest = ((v[:i] or "0"), v[i + 1:]) if i < len(v) and v[i] == ":" else ("0", v)
+        ver, sep, rel = rest.rpartition("-")
+        return (e, ver, rel) if sep else (e, rest, "")
+    ea, va, ra = evr(a); eb, vb, rb = evr(b)
+    r = _rpmvercmp(ea, eb) or _rpmvercmp(va, vb)
+    return _rpmvercmp(ra, rb) if r == 0 and ra and rb else r
+
+
+def _desc(text):
+    out, key = {}, None
+    for line in text.splitlines():
+        if line.startswith("%") and line.endswith("%"): key = line[1:-1]; out[key] = []
+        elif key and line: out[key].append(line)
+    return {k: v[0] for k, v in out.items() if len(v) == 1}
+
+
+def installed_packages(root=PACMAN_DB):
+    """{name: version} of every installed package (local/<pkg>/desc), the same data `pacman -Q` prints."""
+    out, local = {}, os.path.join(root, "local")
+    for d in (os.listdir(local) if os.path.isdir(local) else []):
+        try:
+            with open(os.path.join(local, d, "desc"), "rb") as f: m = _desc(f.read(65536).decode("utf-8", "replace"))
+        except OSError: continue
+        if PKG_RE.fullmatch(m.get("NAME", "")) and m.get("VERSION"): out[m["NAME"]] = m["VERSION"]
+    return out
+
+
+def repo_versions(root=PACMAN_DB):
+    """{name: version} from the sync databases as of the user's last `pacman -Sy` (what `pacman -Qu` compares with).
+    Read in memory only: tarfile.extractfile into a bytes buffer, never extract()/extractall() to disk."""
+    out, sync = {}, os.path.join(root, "sync")
+    for f in (sorted(os.listdir(sync)) if os.path.isdir(sync) else []):
+        if not f.endswith(".db"): continue
+        try:
+            with open(os.path.join(sync, f), "rb") as fh: raw = fh.read(MAX_DB + 1)
+            if len(raw) > MAX_DB or raw[:2] != b"\x1f\x8b": continue              # gzip (pacman's default) and bounded
+            with tarfile.open(fileobj=io.BytesIO(gzip.decompress(raw)), mode="r:") as tf:
+                for m in tf:
+                    if m.isfile() and m.name.endswith("/desc") and m.size < 65536:
+                        d = _desc(tf.extractfile(m).read().decode("utf-8", "replace"))
+                        n, v = d.get("NAME", ""), d.get("VERSION", "")
+                        if PKG_RE.fullmatch(n) and v and n not in out: out[n] = v      # first repo wins, as in pacman
+        except (OSError, EOFError, tarfile.TarError, ValueError): continue
+    return out
+
+
+def pending_updates(root=PACMAN_DB):
+    """(installed {name: version}, [(name, installed, newer)]) — the second part equals `pacman -Qu`."""
+    have, repo = installed_packages(root), repo_versions(root)
+    return have, sorted((n, v, repo[n]) for n, v in have.items() if n in repo and vercmp(repo[n], v) > 0)
+
+
+CHAIN_NOTE = {"store": "Omarchy Store is updated: close it and open it again when this finishes.", "system": "Restart if it asks."}
+CHAIN_RANK = {"store": 0, "apps": 1, "system": 2}   # Update all: the store app FIRST, then other store apps, Omarchy & system LAST
+
+
+def update_chain(steps):
+    """The one line an update shows in the user's terminal. Steps (any order in, fixed order out, each at most once):
+    ("store", version, sha256) -> update_command (download, sha256sum -c, install.sh) + a note to reopen the app;
+    ("apps", (pkg, ...)) -> yay -S <validated names>;  ("system",) -> omarchy update + "Restart if it asks."
+    Joined with && so one failure stops everything after it. Nothing runs until the user presses Enter."""
+    if not isinstance(steps, tuple) or not 0 < len(steps) <= 3: raise ValueError("bad steps")
+    kinds = [st[0] if isinstance(st, tuple) and st else None for st in steps]
+    if len(set(kinds)) != len(kinds) or not set(kinds) <= set(CHAIN_RANK): raise ValueError("bad steps")
+    parts = []
+    for st in sorted(steps, key=lambda x: CHAIN_RANK[x[0]]):
+        if st[0] == "store" and len(st) == 3:
+            parts += [update_command(st[1], st[2]), "printf '\\n  %s\\n\\n'" % CHAIN_NOTE["store"]]
+        elif st[0] == "apps" and len(st) == 2 and isinstance(st[1], tuple) and 0 < len(st[1]) <= MAX_PACKAGES \
+                and len(set(st[1])) == len(st[1]) and all(isinstance(p, str) and PKG_RE.fullmatch(p) for p in st[1]):
+            parts.append("yay -S " + " ".join(st[1]))
+        elif st[0] == "system" and len(st) == 1:
+            parts += ["omarchy update", "printf '\\n  %s\\n'" % CHAIN_NOTE["system"]]
+        else: raise ValueError("bad step")
+    return " && ".join(parts)
+
+
 def terminal_script(argv, title):
     """The exact bash -c text for this install. Every argv element must match ARG_RE (the allow-list words
-    and validated package names do), so this is a hard stop, not a convenience check."""
+    and validated package names do), so this is a hard stop, not a convenience check. The one exception is the app
+    updates, (UPDATE_TAG, steps), whose line comes only from update_chain (every piece checked there)."""
+    if isinstance(argv, tuple) and len(argv) == 2 and argv[0] == UPDATE_TAG:
+        cmd = update_chain(argv[1])
+        return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(cmd), cmd)
     if not argv or not all(isinstance(a, str) and ARG_RE.fullmatch(a) for a in argv):
         raise ValueError("argv outside allow-list")
     cmd = " ".join(shlex.quote(a) for a in argv)
     return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(cmd), cmd)
+
+
+DEFAULT_CATS = [("browsers", "Browsers"), ("developer-tools", "Developer Tools"), ("terminal", "Terminal & CLI"), ("ai", "AI"),
+                ("graphics", "Graphics & Design"), ("video-audio", "Video & Audio"), ("media", "Entertainment"), ("games", "Games"),
+                ("communication", "Social"), ("productivity", "Productivity"), ("education", "Education & Science"),
+                ("security", "Security"), ("utilities", "Utilities")]   # the website's order; the catalog's own list wins when present
+
+
+def cats(v):
+    """[(id, name)] from catalog.json categories: ids checked like app ids, names plain and short."""
+    out = [(c["id"], safe_title(c["name"], c["id"])) for c in (v if isinstance(v, list) else [])[:40]
+           if isinstance(c, dict) and isinstance(c.get("id"), str) and ID_RE.fullmatch(c["id"]) and isinstance(c.get("name"), str)]
+    return out
 
 
 class StoreRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -186,7 +354,7 @@ class Catalog:
     """Local copy of the public catalog, used ONLY to map an app id → install method + package names.
     Fetched over TLS from the store origin at start; written atomically with owner-only permissions."""
     def __init__(self):
-        self.apps = {}; self.busy = False; self.last_try = -REFRESH_GAP_US
+        self.apps = {}; self.latest = None; self.categories = []; self.busy = False; self.last_try = -REFRESH_GAP_US
         try: self.path = os.path.join(private_dir(CACHE), "catalog.json"); self._load()
         except OSError as e: log("cache directory unusable, running without a catalog:", e); self.path = None
 
@@ -201,7 +369,7 @@ class Catalog:
 
     @classmethod
     def from_apps(cls, apps):
-        c = cls.__new__(cls); c.path = None; c.apps = {}; c._set(apps); return c
+        c = cls.__new__(cls); c.path = None; c.apps = {}; c.latest = None; c.categories = []; c._set(apps); return c
 
     def _set(self, apps):
         out = {}
@@ -213,7 +381,8 @@ class Catalog:
 
     def _load(self):
         try:
-            with open(self.path, "rb") as f: self._set(json.load(f).get("apps", []))
+            with open(self.path, "rb") as f: j = json.load(f)
+            self._set(j.get("apps", [])); self.latest = j.get("desktop_latest"); self.categories = cats(j.get("categories"))
         except Exception: self.apps = {}                                 # it is a cache: anything unreadable means "no catalog"
 
     def _refresh(self):
@@ -235,7 +404,7 @@ class Catalog:
             fd, tmp = tempfile.mkstemp(dir=CACHE, prefix=".catalog-")  # random name, 0600, O_EXCL: no symlink games
             with os.fdopen(fd, "wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
             os.replace(tmp, self.path); tmp = None
-            self._set(j["apps"]); log("catalog refreshed:", len(self.apps), "apps")   # the tree we validated, parsed once
+            self._set(j["apps"]); self.latest = j.get("desktop_latest"); self.categories = cats(j.get("categories")); log("catalog refreshed:", len(self.apps), "apps")   # the tree we validated, parsed once
         except Exception as e:                                           # offline is normal; the app still works
             log("catalog refresh skipped:", e)
             if tmp:
@@ -287,6 +456,59 @@ def open_in_terminal(argv, title):
         log("terminal failed to start:", e); return False
 
 
+HYPR_SIG_RE = re.compile(r"[A-Za-z0-9_]{1,128}")
+HYPR_ADDR_RE = re.compile(r"0x[0-9a-f]{1,16}")
+HYPR_WS_RE = re.compile(r"[0-9]{1,6}")
+HYPR_REQUESTS = {   # the ONLY requests this app ever sends to the compositor; %s slots take a checked address / workspace number
+    "maximize": 'dispatch hl.dsp.window.fullscreen({ mode = "maximized", window = "address:%s" })',
+    "bring_back": 'dispatch hl.dsp.window.move({ workspace = "%s", follow = false, window = "address:%s" })',
+    "focus": 'dispatch hl.dsp.focus({ window = "address:%s" })',
+    "minimize": 'dispatch hl.dsp.window.move({ workspace = "special:sd4-minimized", follow = false, window = "address:%s" })',   # SnapDock's own place; a relaunch or the dock brings it back
+}
+
+
+def hypr_ask(req):
+    """One request to the user's own Hyprland over its local socket; returns the reply text, or None (not Hyprland, or no answer)."""
+    sig, run = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""), os.environ.get("XDG_RUNTIME_DIR", "")
+    if not HYPR_SIG_RE.fullmatch(sig) or not os.path.isabs(run) or not (req in ("j/clients", "j/activeworkspace") or req.startswith("dispatch hl.dsp.")):
+        return None
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1.0); s.connect(os.path.join(run, "hypr", sig, ".socket.sock")); s.sendall(req.encode())
+        out = b""
+        while len(out) < (4 << 20):
+            b = s.recv(65536)
+            if not b: break
+            out += b
+        return out.decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def hypr_window(action):
+    """'maximize' toggles the maximized state of OUR window; 'bring_back' moves it from a hidden special workspace to the
+    current one and focuses it. Returns True when the compositor took the request, False when this is not Hyprland."""
+    try:
+        clients = json.loads(hypr_ask("j/clients") or "null")
+        mine = [c for c in clients if isinstance(c, dict) and c.get("pid") == os.getpid()] if isinstance(clients, list) else []
+    except ValueError:
+        return False
+    if len(mine) != 1: return False
+    addr = str(mine[0].get("address", ""))
+    if not HYPR_ADDR_RE.fullmatch(addr): return False
+    if action in ("maximize", "minimize"):
+        return hypr_ask(HYPR_REQUESTS[action] % addr) is not None
+    if action == "bring_back":
+        if not str((mine[0].get("workspace") or {}).get("name", "")).startswith("special:"): return True   # nothing to do
+        try: ws = str(json.loads(hypr_ask("j/activeworkspace") or "null").get("id", ""))
+        except (ValueError, AttributeError): return False
+        if not HYPR_WS_RE.fullmatch(ws): return False
+        return hypr_ask(HYPR_REQUESTS["bring_back"] % (ws, addr)) is not None and hypr_ask(HYPR_REQUESTS["focus"] % addr) is not None
+    return False
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app, catalog):
         super().__init__(application=app, title="Omarchy Store", default_width=1380, default_height=900)
@@ -324,6 +546,7 @@ class Window(Adw.ApplicationWindow):
         self.web.connect("decide-policy", self.on_policy)
         self.web.connect("create", self.on_create)
         self.web.connect("load-failed", self.on_load_failed)
+        self.web.connect("web-process-terminated", self.on_web_crash)         # 1.1.4: the window never goes blank; a plain page with Reload instead
         self.web.connect("load-changed", self.on_load_changed)
         self.web.connect("authenticate", lambda _w, req: (req.cancel(), True)[1])      # never a password prompt — not even WebKit's own
         self.web.connect("run-file-chooser", lambda _w, req: (req.cancel(), True)[1])  # the store never needs a file from your disk
@@ -343,21 +566,43 @@ class Window(Adw.ApplicationWindow):
 
         # --- chrome ---
         tv = Adw.ToolbarView(); hb = Adw.HeaderBar()
+        hb.set_decoration_layout(":close")                                  # the toolkit's own maximize/minimize requests are ignored on Hyprland
+        mx = Gtk.Button(icon_name="window-maximize-symbolic", tooltip_text="Maximize / restore (double-click the title too)")
+        mx.connect("clicked", lambda *_: self.toggle_max()); hb.pack_end(mx)
+        mn = Gtk.Button(icon_name="window-minimize-symbolic", tooltip_text="Minimize (open Omarchy Store again, or click it in the dock, to bring it back)")
+        mn.connect("clicked", lambda *_: hypr_window("minimize") or self.minimize()); hb.pack_end(mn)
+        dbl = Gtk.GestureClick(button=1); dbl.connect("pressed", lambda _g, n, _x, _y: n == 2 and self.toggle_max()); hb.add_controller(dbl)
         for icon, tip, cb in (("go-previous-symbolic", "Back", lambda *_: self.web.go_back()),
                               ("go-next-symbolic", "Forward", lambda *_: self.web.go_forward()),
                               ("go-home-symbolic", "Store home", lambda *_: (self.catalog.refresh(force=True), self.web.load_uri(HOME_URL))),
                               ("view-refresh-symbolic", "Reload", lambda *_: (self.catalog.refresh(force=True), self.web.reload()))):
             b = Gtk.Button(icon_name=icon, tooltip_text=tip); b.connect("clicked", cb); hb.pack_start(b)
+        self.upd_btn = Gtk.Button(visible=False, css_classes=["suggested-action", "pill"], tooltip_text="Open Updates")
+        self.upd_btn.connect("clicked", lambda *_: self.show_view("updates")); hb.pack_end(self.upd_btn)
         menu = Gio.Menu()
-        for label, action in (("About Omarchy Store", "app.about"), ("Security model", "app.security"), ("Quit", "app.quit")):
+        for label, action in (("Check for updates", "win.check-update"), ("About Omarchy Store", "app.about"), ("Security model", "app.security"), ("Quit", "app.quit")):
             menu.append(label, action)
         hb.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
         self.title_w = Adw.WindowTitle(title="Omarchy Store", subtitle="installs run in your terminal · nothing runs in the background")
         hb.set_title_widget(self.title_w); tv.add_top_bar(hb)
-        self.toast = Adw.ToastOverlay(); self.toast.set_child(self.web); tv.set_content(self.toast)
+        self.stack = Gtk.Stack(hexpand=True, vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.add_named(self.web, "web")
+        self.upd_box, self.inst_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14), Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for name, box in (("updates", self.upd_box), ("installed", self.inst_box)):
+            box.set_margin_top(24); box.set_margin_bottom(24); box.set_margin_start(24); box.set_margin_end(24)
+            sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER); sc.set_child(Adw.Clamp(maximum_size=900, child=box)); self.stack.add_named(sc, name)
+        body = Gtk.Box(); body.append(self.build_sidebar()); body.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)); body.append(self.stack)
+        self.toast = Adw.ToastOverlay(); self.toast.set_child(body); tv.set_content(self.toast)
         self.set_content(tv)
-        self.web.connect("notify::title", lambda *_: self.title_w.set_title(self.web.get_title() or "Omarchy Store"))
+        self.web.connect("notify::title", lambda *_: self.stack.get_visible_child_name() == "web" and self.title_w.set_title(self.web.get_title() or "Omarchy Store"))
         self.web.load_uri(HOME_URL)
+        self.upd = {"have": {}, "pending": [], "store": None, "busy": False, "when": ""}
+        a = Gio.SimpleAction.new("check-update", None); a.connect("activate", lambda *_: (self.show_view("updates"), self.check_updates(asked=True))); self.add_action(a)
+        self.check_updates()                                                # once, when the window opens: local package lists + the catalog copy
+
+    def toggle_max(self):
+        if not hypr_window("maximize"):                                    # other desktops honour the toolkit's request
+            (self.unmaximize if self.is_maximized() else self.maximize)()
 
     def on_script_dialog(self, web, dialog):
         return dialog.get_dialog_type() == WebKit.ScriptDialogType.PROMPT  # True = swallowed; alert/confirm keep WebKit's plain dialog
@@ -439,6 +684,13 @@ class Window(Adw.ApplicationWindow):
         self.web.load_alternate_html(html, uri if is_webview_url(uri or "") else HOME_URL, HOME_URL)
         return True
 
+    def on_web_crash(self, web, reason):
+        log("page engine stopped:", reason.value_nick if hasattr(reason, "value_nick") else reason)
+        html = """<html><body style="margin:0;height:100vh;display:grid;place-items:center;background:#070b16;color:#e6ecff;font-family:Inter,system-ui">
+        <div style="text-align:center;max-width:460px"><h2>The page stopped</h2>
+        <p style="color:#9aa6c4">The page engine stopped responding. Press Reload at the top to open the store again.</p></div></body></html>"""
+        self.web.load_alternate_html(html, HOME_URL, HOME_URL)              # Reload then loads the store, not this text
+
     # ---- the one bridge from the page ----
     def on_message(self, ucm, value):
         if not is_store_url(self.doc_uri or ""): return                    # only a committed store document may talk to us — never one still loading in
@@ -466,6 +718,181 @@ class Window(Adw.ApplicationWindow):
             return False
         GLib.timeout_add(500, watch)
 
+    # ---- sidebar, Updates and Installed (1.1.4) ----
+    NAV = (("Discover", "starred-symbolic", "/"), ("Top Charts", "view-list-ordered-symbolic", "/charts/"),
+           ("Updates", "software-update-available-symbolic", "updates"), ("Installed", "object-select-symbolic", "installed"),
+           ("New Apps", "starred-symbolic", "/new/"))
+    BROWSE = (("Themes", "/themes/"), ("Plugins", "/plugins/"), ("Screensavers", "/screensavers/"))
+
+    def build_sidebar(self):
+        lb = Gtk.ListBox(css_classes=["navigation-sidebar"], selection_mode=Gtk.SelectionMode.SINGLE)
+        self.nav_badges, self.nav_targets = {}, {}
+        def row(label, icon, target, badge=False):
+            r = Gtk.ListBoxRow(); bx = Gtk.Box(spacing=10, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+            if icon: bx.append(Gtk.Image(icon_name=icon))
+            bx.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+            if badge:
+                bl = Gtk.Label(visible=False, css_classes=["os-badge"]); bx.append(bl); self.nav_badges[target] = bl
+            r.set_child(bx); self.nav_targets[r] = target; lb.append(r); return r
+        for label, icon, target in self.NAV: row(label, icon, target, badge=target in ("updates", "installed"))
+        head = Gtk.Label(label="Browse", xalign=0, css_classes=["dim-label", "caption-heading"], margin_top=12, margin_start=12)
+        r = Gtk.ListBoxRow(selectable=False, activatable=False); r.set_child(head); lb.append(r)
+        for label, path in self.BROWSE: row(label, None, path)
+        for cid, name in (self.catalog.categories or DEFAULT_CATS): row(name, None, f"/category/{cid}/")
+        r = Gtk.ListBoxRow(selectable=False, activatable=False); r.set_child(Gtk.Separator(margin_top=8, margin_bottom=8)); lb.append(r)
+        row("Settings & About", "help-about-symbolic", "about")
+        lb.connect("row-activated", lambda _lb, r: self.nav(self.nav_targets.get(r, "")))
+        self.sidebar_list = lb
+        logo = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True, height_request=29, margin_top=14, margin_bottom=10, margin_start=14, margin_end=14,
+                           alternative_text="Omarchy Store")
+        lockup = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lockup.png")   # the official lockup PNG installed next to this file
+        if os.path.isfile(lockup): logo.set_filename(lockup)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL); col.append(logo); col.append(lb)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, width_request=232, vexpand=True); sc.set_child(col)
+        css = Gtk.CssProvider()
+        css.load_from_string(".os-badge{background:#2F6BFF;color:#fff;border-radius:999px;padding:0 8px;font-weight:700;font-size:12px}"
+                             ".os-badge.muted{background:alpha(currentColor,.15);color:inherit}.os-hl{background:alpha(#2F6BFF,.16);border-radius:12px}")
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        return sc
+
+    def select_nav(self, target):
+        r = next((r for r, t in self.nav_targets.items() if t == target), None)
+        if r: self.sidebar_list.select_row(r)
+
+    def nav(self, target):
+        if target == "about": self.get_application().about(); return
+        if target in ("updates", "installed"): self.show_view(target); return
+        if isinstance(target, str) and target.startswith("/"):
+            self.stack.set_visible_child_name("web"); self.select_nav(target); self.web.load_uri(urllib.parse.urljoin(HOME_URL, target))
+
+    def show_view(self, name, focus_all=False):
+        if name not in ("updates", "installed"): return
+        self.stack.set_visible_child_name(name); self.title_w.set_title("Updates" if name == "updates" else "Installed")
+        self.select_nav(name)
+        self.render_updates(); self.render_installed()
+        if focus_all: self.all_btn.grab_focus()
+
+    def check_updates(self, asked=False):
+        """User-triggered (button / menu / dock action) or once when the window opens. Reads the local package database and
+        the catalog copy; the only network contact is the usual catalog fetch from the store when the user asks."""
+        if self.upd["busy"]: return
+        self.upd["busy"] = True; self.render_updates()
+        if asked: self.catalog.refresh(force=True)
+        res = {}
+        def work():
+            try: res["have"], res["pending"] = pending_updates()
+            except Exception as e: log("package database unreadable:", e); res["have"], res["pending"] = {}, []
+        th = GLib.Thread.new("updates", work)
+        tries = [0]
+        def finish():
+            tries[0] += 1
+            if ("pending" not in res or self.catalog.busy) and tries[0] < 60: return True
+            th.join()
+            self.upd.update(have=res.get("have", {}), pending=res.get("pending", []), store=app_update(self.catalog.latest), busy=False,
+                            when=GLib.DateTime.new_now_local().format("%H:%M"))
+            self.render_updates(); self.render_installed()
+            if asked: self.note(f"{self.upd_total()} update(s) found." if self.upd_total() else "Everything is up to date.")
+            return False
+        GLib.timeout_add(500, finish)
+
+    def store_apps(self):
+        """[(entry, packages, method)] for catalog apps whose packages are all installed (pacman/omarchy/AUR listings)."""
+        have, out = self.upd["have"], []
+        for a in list(self.catalog.apps.values()):
+            inst = a.get("install") if isinstance(a.get("install"), dict) else {}
+            pk, m = inst.get("packages"), inst.get("method")
+            if m in ("pacman", "omarchy", "aur") and self.catalog.command_for(a) and all(p in have for p in pk): out.append((a, tuple(pk), m))
+        return sorted(out, key=lambda x: safe_title(x[0].get("name") or x[0]["id"], x[0]["id"]).lower())
+
+    def upd_apps(self):
+        newer = {n: (v, w) for n, v, w in self.upd["pending"]}
+        return [(a, pk, newer) for a, pk, m in self.store_apps() if m != "aur" and any(p in newer for p in pk)]
+
+    def upd_total(self):
+        return len(self.upd["pending"]) + (1 if self.upd["store"] else 0)
+
+    def run_update(self, steps, title):
+        proc = open_in_terminal((UPDATE_TAG, steps), title)
+        if not proc: self.note("No terminal could be opened. Run the command yourself: omarchy update"); return
+        self.note("Opened your terminal. Read the command shown there: Enter runs it, Ctrl+C cancels.")
+        GLib.timeout_add(500, lambda: proc.poll() is None)                 # reap the terminal when it exits
+
+    def _clear(self, box):
+        while (c := box.get_first_child()): box.remove(c)
+
+    def _row(self, title, sub, btn=None, cb=None, hl=False):
+        r = Gtk.Box(spacing=12, margin_top=4, margin_bottom=4, css_classes=["os-hl"] if hl else [])
+        if hl: r.set_margin_start(0)
+        t = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, margin_start=10 if hl else 0, margin_top=6 if hl else 0, margin_bottom=6 if hl else 0)
+        t.append(Gtk.Label(label=title, xalign=0, css_classes=["heading"], wrap=True)); t.append(Gtk.Label(label=sub, xalign=0, css_classes=["dim-label"], wrap=True))
+        r.append(t)
+        if btn:
+            b = Gtk.Button(label=btn, valign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"] if hl else ["pill"], margin_end=10 if hl else 0)
+            b.connect("clicked", lambda *_: cb()); r.append(b)
+        return r
+
+    def _group(self, box, title, count, desc, btn=None, cb=None):
+        g = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=14, margin_bottom=14, margin_start=16, margin_end=16); g.append(inner)
+        h = Gtk.Box(spacing=10); h.append(Gtk.Label(label=title, xalign=0, css_classes=["title-3"]))
+        if count is not None: h.append(Gtk.Label(label=str(count), css_classes=["os-badge"] if count else ["os-badge", "muted"], valign=Gtk.Align.CENTER))
+        h.append(Gtk.Box(hexpand=True))
+        if btn:
+            b = Gtk.Button(label=btn, css_classes=["pill"]); b.connect("clicked", lambda *_: cb()); h.append(b)
+        inner.append(h)
+        if desc: inner.append(Gtk.Label(label=desc, xalign=0, wrap=True, css_classes=["dim-label"]))
+        box.append(g); return inner
+
+    def render_updates(self):
+        u, box = self.upd, self.upd_box; self._clear(box)
+        total, apps, store = self.upd_total(), self.upd_apps(), u["store"]
+        for key, n in (("updates", total), ("installed", len(self.store_apps()))):
+            bl = self.nav_badges.get(key)
+            if bl: bl.set_label(str(n)); bl.set_visible(n > 0); bl.set_css_classes(["os-badge"] if key == "updates" else ["os-badge", "muted"])
+        self.upd_btn.set_label(f"Updates  {total}"); self.upd_btn.set_visible(total > 0)
+        head = Gtk.Box(spacing=12); tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        tb.append(Gtk.Label(label="Updates", xalign=0, css_classes=["title-1"]))
+        tb.append(Gtk.Label(label="Checking…" if u["busy"] else (f"Checked at {u['when']}" if u["when"] else "Not checked yet"), xalign=0, css_classes=["dim-label"]))
+        head.append(tb)
+        chk = Gtk.Button(label="Check for updates", css_classes=["pill"], valign=Gtk.Align.CENTER, sensitive=not u["busy"])
+        chk.connect("clicked", lambda *_: self.check_updates(asked=True)); head.append(chk)
+        steps = (((("store", store[0], store[1]),) if store else ()) + ((("apps", tuple(sorted({p for _, pk, nw in apps for p in pk if p in nw}))),) if apps else ())
+                 + (("system",),))
+        self.all_btn = Gtk.Button(label="Update all", css_classes=["pill", "suggested-action"], valign=Gtk.Align.CENTER, sensitive=not u["busy"])
+        self.all_btn.connect("clicked", lambda *_: self.run_update(steps, "Update all"))
+        head.append(self.all_btn); box.append(head)
+        box.append(Gtk.Label(xalign=0, wrap=True, css_classes=["dim-label"], label=(
+            "Nothing here runs by itself: an update starts only when you press a button here and then Enter in your own terminal. "
+            "No background checks, no timers, no hooks, and this app never runs anything as root.")))
+        g = self._group(box, "Apps", len(apps) + (1 if store else 0), "Apps you installed from the store. Each button opens your terminal with the exact command.")
+        if store:
+            g.append(self._row(f"Omarchy Store {store[0]} available", f"You have {VERSION}. Close and reopen the app after it updates.", "Update",
+                               lambda st=store: self.run_update((("store", st[0], st[1]),), f"Update Omarchy Store to {st[0]}"), hl=True))
+        for a, pk, nw in apps:
+            name = safe_title(a.get("name") or a["id"], a["id"]); p0 = next(p for p in pk if p in nw)
+            todo = tuple(p for p in pk if p in nw)
+            g.append(self._row(name, f"{nw[p0][0]}  →  {nw[p0][1]}", "Update", lambda t=todo, n=name: self.run_update((("apps", t),), f"Update {n}")))
+        if not apps and not store: g.append(Gtk.Label(label="Your store apps are up to date.", xalign=0))
+        g.append(Gtk.Label(label="Apps from the AUR are updated by Omarchy & system below.", xalign=0, wrap=True, css_classes=["dim-label", "caption"]))
+        pend = u["pending"]; om = next(((v, w) for n, v, w in pend if n == "omarchy"), None)
+        g2 = self._group(box, "Omarchy & system", len(pend), "Omarchy, Linux, the desktop and every system package, plus AUR apps and Omarchy's own "
+                         "migrations, in one go: the same as Omarchy menu › Update. It may ask you to restart, so Update all runs it last.",
+                         "Update Omarchy & system", lambda: self.run_update((("system",),), "Update Omarchy & system"))
+        if om: g2.append(self._row(f"Omarchy {om[0]}  →  {om[1]}", "Omarchy itself"))
+        for n, v, w in [x for x in pend if x[0] != "omarchy"][:8]: g2.append(self._row(n, f"{v}  →  {w}"))
+        if len(pend) > 9: g2.append(Gtk.Label(label=f"+{len(pend) - 9 if om else len(pend) - 8} more", xalign=0, css_classes=["dim-label"]))
+        if not pend: g2.append(Gtk.Label(label="No newer packages in your last package list. The button still runs Omarchy's own update check.", xalign=0, wrap=True))
+
+    def render_installed(self):
+        box = self.inst_box; self._clear(box); items = self.store_apps()
+        box.append(Gtk.Label(label="Installed", xalign=0, css_classes=["title-1"]))
+        box.append(Gtk.Label(label=f"{len(items)} apps from the store are installed on this computer." if items else "No apps from the store found on this computer yet.",
+                             xalign=0, css_classes=["dim-label"]))
+        for a, pk, m in items:
+            name = safe_title(a.get("name") or a["id"], a["id"]); aid = a["id"]
+            box.append(self._row(name, f"{self.upd['have'].get(pk[0], '')} · {'AUR' if m == 'aur' else 'Arch / Omarchy package'}", "Open page",
+                                 lambda i=aid: self.nav(f"/app/{i}/")))
+
     def note(self, text):
         t = Adw.Toast(title=text, timeout=5); t.set_use_markup(False); self.toast.add_toast(t)
 
@@ -476,6 +903,8 @@ class App(Adw.Application):
         self.fetch = fetch; self.catalog = Catalog()                     # the cached copy now; the network refresh waits for do_startup
         for name, cb in (("quit", lambda *_: self.quit()), ("about", self.about), ("security", self.security)):
             a = Gio.SimpleAction.new(name, None); a.connect("activate", cb); self.add_action(a)
+        self.start_view = None
+        v = Gio.SimpleAction.new("show-view", GLib.VariantType.new("s")); v.connect("activate", lambda _a, p: self.open_view(p.get_string())); self.add_action(v)
         self.set_accels_for_action("app.quit", ["<Primary>q"])
 
     def do_startup(self):
@@ -484,13 +913,26 @@ class App(Adw.Application):
         if self.fetch: self.catalog.refresh()
 
     def do_activate(self):
-        win = self.props.active_window or Window(self, self.catalog); win.present()
+        win = self.props.active_window
+        if win is None: win = Window(self, self.catalog)
+        else: hypr_window("bring_back")                                    # a second launch brings a window a dock had hidden back to this workspace
+        win.present()
+        if self.start_view: v, self.start_view = self.start_view, None; self.open_view(v)
+
+    def open_view(self, view):
+        """Dock / launcher actions (Desktop Actions in the .desktop file): they only OPEN a view; nothing is run."""
+        if view not in VIEWS: return
+        if self.props.active_window is None: self.start_view = view; self.activate(); return
+        w = self.props.active_window; hypr_window("bring_back"); w.present()
+        w.show_view("installed" if view == "installed" else "updates", focus_all=view == "update-all")
+        if view in ("updates", "update-all"): w.check_updates(asked=view == "updates")
 
     def about(self, *_):
         d = Adw.AboutDialog(application_name="Omarchy Store", application_icon=APP_ID, version=VERSION,
                             developer_name="Kernlux Development Labs", website="https://omarchystore.com",
                             issue_url="https://omarchystore.com/contact/", license_type=Gtk.License.MIT_X11,
-                            comments="The community app store for Omarchy Linux. Independent project, not affiliated with Omarchy or 37signals.")
+                            comments="The community app store for Omarchy Linux. Independent project, not affiliated with Omarchy or 37signals.\n\n"
+                                     "Pin it: right-click its icon in your dock and choose Pin / Keep in dock.")
         d.present(self.props.active_window)
 
     def security(self, *_):
@@ -631,7 +1073,7 @@ def self_test():
     calls = [(dotted(n.func), n) for n in nodes if isinstance(n, ast.Call)]
     FORBIDDEN = {"eval", "exec", "compile", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "breakpoint",
                  "importlib", "sys.modules", "sys.path", "os.system", "os.popen", "os.putenv", "os.unsetenv", "os.open", "os.write",
-                 "os.truncate", "os.rename", "os.link", "os.symlink", "os.mkdir", "os.remove", "os.chown", "os.utime", "pty", "socket",
+                 "os.truncate", "os.rename", "os.link", "os.symlink", "os.mkdir", "os.remove", "os.chown", "os.utime", "pty",
                  "ctypes", "pathlib", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.run",
                  "subprocess.getoutput", "subprocess.getstatusoutput", "urllib.request.urlopen", "urllib.request.urlretrieve"}
     FORBIDDEN_PREFIXES = ("os.exec", "os.spawn", "os.posix_spawn", "os.fork", "os.set", "GLib.spawn", "Gio.Subprocess", "Gio.AppInfo",
@@ -640,7 +1082,16 @@ def self_test():
     DUNDERS = ("__dict__", "__getattribute__", "__class__", "__subclasses__", "__globals__", "__builtins__", "__code__", "__doc__")
     forbidden_hits = sorted({f for f, _ in refs if f in FORBIDDEN or (f.startswith(FORBIDDEN_PREFIXES) and f not in ALLOWED_PREFIXED) or f.endswith(DUNDERS)})
     # open() only as the audited `open(path, "rb")` read of the catalog cache — two positional arguments, no keywords
-    bad_open = [ast.unparse(n)[:50] for f, n in calls if f == "open" and not (len(n.args) == 2 and ast.unparse(n.args[0]) == "self.path" and getattr(n.args[1], "value", "") == "rb" and not n.keywords)]
+    # 1.1.4: plus exactly two read-only opens of the pacman database, inside installed_packages / repo_versions
+    db_ids = {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name in ("installed_packages", "repo_versions") for n in ast.walk(fn)}
+    DB_OPENS = {"open(os.path.join(local, d, 'desc'), 'rb')", "open(os.path.join(sync, f), 'rb')"}
+    bad_open = [ast.unparse(n)[:50] for f, n in calls if f == "open" and not (len(n.args) == 2 and ast.unparse(n.args[0]) == "self.path" and getattr(n.args[1], "value", "") == "rb" and not n.keywords)
+                and not (id(n) in db_ids and ast.unparse(n) in DB_OPENS)]
+    tar_refs = [(f, n) for f, n in refs if f.split(".")[0] in ("tarfile", "gzip", "io") or f.endswith((".extract", ".extractall"))]
+    tar_ok = all(id(n) in db_ids for _, n in tar_refs) and not any(f.endswith((".extract", ".extractall")) for f, _ in tar_refs) \
+        and sorted({f for f, _ in tar_refs}) == ["gzip", "gzip.decompress", "io", "io.BytesIO", "tarfile", "tarfile.TarError", "tarfile.open"]
+    db_refs = [n for f, n in refs if f == "PACMAN_DB"]
+    db_ok = PACMAN_DB == "/var/lib/pacman" and len(db_refs) == 4   # the constant + three default arguments, nothing else
     singletons = {f: [n for g, n in refs if g == f] for f in ("WebKit.UserScript.new", "Gtk.UriLauncher.new", "ucm.register_script_message_handler")}
     load_html = [f for f, _ in refs if f.endswith(("load_html", "load_plain_text", "load_bytes"))]
     popen_sites = [n for f, n in calls if f.endswith("Popen")]
@@ -651,7 +1102,12 @@ def self_test():
     refresh_ids = {id(n) for fn in nodes if isinstance(fn, ast.FunctionDef) and fn.name == "_refresh" for n in ast.walk(fn)}
     net_refs = [(f, n) for f, n in refs if f in ("urllib.request.build_opener", "urllib.request.Request", "opener.open", "opener")]
     net_pinned = sorted(f for f, _ in net_refs) == ["opener", "opener", "opener.open", "urllib.request.Request", "urllib.request.build_opener"] and all(id(n) in refresh_ids for _, n in net_refs)
-    ALLOWED_IMPORTS = {"json", "os", "re", "shlex", "shutil", "subprocess", "sys", "tempfile", "urllib.parse", "urllib.request", "gi", "gi.repository"}
+    ALLOWED_IMPORTS = {"gzip", "io", "json", "os", "re", "shlex", "shutil", "socket", "subprocess", "sys", "tarfile", "tempfile", "urllib.parse", "urllib.request", "gi", "gi.repository"}
+    ask_ids = {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "hypr_ask" for n in ast.walk(fn)}
+    sock_refs = [(f, n) for f, n in refs if f.startswith("socket")]
+    sock_ok = bool(sock_refs) and all(id(n) in ask_ids for _, n in sock_refs) and sorted({f for f, _ in sock_refs}) == ["socket", "socket.AF_UNIX", "socket.SOCK_STREAM", "socket.socket"]
+    ask_sites = [n for f, n in calls if f == "hypr_ask"]
+    ask_args_ok = all(ast.unparse(n.args[0]) in ("'j/clients'", "'j/activeworkspace'") or ast.unparse(n.args[0]).startswith("HYPR_REQUESTS[") for n in ask_sites)
     imports = {a.name for n in nodes if isinstance(n, ast.Import) for a in n.names} | {n.module or "" for n in nodes if isinstance(n, ast.ImportFrom)}
     aliased = [a.name for n in nodes if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names if a.asname]
     from_names = {a.name for n in nodes if isinstance(n, ast.ImportFrom) for a in n.names}
@@ -669,8 +1125,32 @@ def self_test():
     strs += ["".join(v.value if isinstance(v, ast.Constant) else (v.value.value if isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Constant) and isinstance(v.value.value, str) else "")
                      for v in n.values) for n in nodes if isinstance(n, ast.JoinedStr)]
     priv = [x for x in strs if re.search(r"\b(sudo|pkexec|doas|run0|polkit|NOPASSWD|sudoers|systemd|systemctl|setuid|setgid)\b", x)]
-    syspath = [x for x in strs if re.match(r"/(bin|sbin|lib|lib32|lib64|etc|usr|var|tmp|dev|boot|opt|root|srv|proc|sys|run|home|mnt|media)(/|$)", x)]
-    fetchers = [x for x in strs if re.search(r"\b(curl|wget)\b", x)]
+    syspath = [x for x in strs if re.match(r"/(bin|sbin|lib|lib32|lib64|etc|usr|var|tmp|dev|boot|opt|root|srv|proc|sys|run|home|mnt|media)(/|$)", x) and x != "/var/lib/pacman"]
+    # 1.1.4: the ONE allowed fetch word is the curl inside update_command (the line the user's terminal shows for an app update)
+    upd_fn = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "update_command")
+    upd_strs = set(consts(update_command.__code__, [])) | {"".join(v.value if isinstance(v, ast.Constant) else "" for v in n.values) for n in ast.walk(upd_fn) if isinstance(n, ast.JoinedStr)}
+    fetchers = [x for x in strs if re.search(r"\b(curl|wget)\b", x) and x not in upd_strs]
+    H0 = "0" * 64; ul = update_command("9.9.9", H0)
+    upd_ok = (ul == f'mkdir -p ~/Downloads && cd ~/Downloads && curl -fLO https://omarchystore.com/downloads/omarchy-store-desktop-9.9.9.tar.gz && echo "{H0}  omarchy-store-desktop-9.9.9.tar.gz" | sha256sum -c && tar xf omarchy-store-desktop-9.9.9.tar.gz && cd omarchy-store-desktop-9.9.9 && ./install.sh'
+              and UPDATE_ORIGIN == "https://omarchystore.com")
+    upd_refuse = True
+    for bad in (("1.2", H0), ("1.2.3;rm", H0), ("1.2.3\n", H0), ("1.2.3", "z" * 64), ("1.2.3", H0 + "\n"), ("1.2.3", H0[:63]), (None, H0), ("1.2.3", None)):
+        try: update_command(*bad); upd_refuse = False
+        except ValueError: pass
+    upd_newer = (app_update({"version": "999.0.0", "sha256": H0}) == ("999.0.0", H0) and app_update({"version": VERSION, "sha256": H0}) is None
+                 and app_update({"version": "0.0.1", "sha256": H0}) is None and app_update({"version": "999.0.0", "sha256": "x"}) is None
+                 and app_update({"version": "999.0.0", "sha256": H0, "url": "https://evil.example/x.tar.gz"}) == ("999.0.0", H0) and app_update(None) is None)
+    sc_chain = update_chain((("system",), ("apps", ("btop", "zen-browser-bin")), ("store", "9.9.9", H0)))
+    chain_ok = sc_chain == (ul + " && printf '\\n  Omarchy Store is updated: close it and open it again when this finishes.\\n\\n' && yay -S btop zen-browser-bin"
+                            " && omarchy update && printf '\\n  Restart if it asks.\\n'") and "sudo" not in sc_chain
+    chain_refuse = True
+    for bad in ((), (("apps", ("btop;id",)),), (("apps", ("-x",)),), (("apps", ("a", "a")),), (("system",), ("system",)), (("rm",),), (("apps", []),), [("system",)]):
+        try: update_chain(bad); chain_refuse = False
+        except (ValueError, TypeError, KeyError): pass
+    vc_ok = all(vercmp(a, b) == w for a, b, w in (("1.0", "1.0", 0), ("1:1.0", "2.0", 1), ("1.0-2", "1.0-1", 1), ("1.0rc1", "1.0", -1), ("1.0a", "1.0", -1),
+                                                    ("1.01", "1.1", 0), ("1.0.1", "1.0", 1), ("2.0", "10.0", -1), ("1..0", "1.0", 1), ("1.0-1", "1.0", 0)))
+    try: terminal_script([UPDATE_TAG, "9.9.9", H0], "t"); tag_list_refused = False      # a list (what a catalog build makes) never takes the update branch
+    except ValueError: tag_list_refused = True
     qa = {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name in ("probe", "snapshot") for n in ast.walk(fn)}
     eval_js = [f for f, n in calls if id(n) not in qa and f.endswith(("evaluate_javascript", "run_javascript", "call_async_javascript_function"))]
     def calls_in(name):
@@ -690,6 +1170,11 @@ def self_test():
          and getattr(net_reqs[0].args[0], "id", "") == "CATALOG_URL", "exactly one network request, of CATALOG_URL, through the store-only redirect handler, all inside Catalog._refresh"),
         (imports <= ALLOWED_IMPORTS and not aliased and from_names <= {"Gtk", "Adw", "WebKit", "GLib", "Gio", "Gdk"},
          f"imports limited to {sorted(ALLOWED_IMPORTS)}, no aliases, only the six gi namespaces (got {sorted(imports - ALLOWED_IMPORTS)} {aliased} {sorted(from_names - {'Gtk', 'Adw', 'WebKit', 'GLib', 'Gio', 'Gdk'})})"),
+        (sock_ok, "socket is used only inside hypr_ask, AF_UNIX stream only (the user's own compositor socket)"),
+        (ask_args_ok and len(HYPR_REQUESTS) == 4 and all(v.startswith("dispatch hl.dsp.") for v in HYPR_REQUESTS.values()),
+         "compositor requests are only the client list, the active workspace, and the four fixed HYPR_REQUESTS"),
+        (not HYPR_ADDR_RE.fullmatch('0x1" }) hl.exec_cmd("x') and not HYPR_WS_RE.fullmatch("1\") ") and HYPR_ADDR_RE.fullmatch("0x55a4fbb251c0"),
+         "compositor address/workspace patterns refuse anything that could close a quote"),
         (not env_writes, f"the environment is never modified (no os.putenv / os.environ writes) {env_writes}"),
         (writers == ["os.chmod", "os.fdopen", "os.fsync", "os.makedirs", "os.replace", "os.unlink", "tempfile.mkstemp"] and {"os.makedirs", "os.chmod"} <= calls_in("private_dir")
          and {"tempfile.mkstemp", "os.fdopen", "os.replace", "os.unlink", "os.fsync"} <= calls_in("_refresh"), f"file-writing calls exist only in private_dir and Catalog._refresh {writers}"),
@@ -703,7 +1188,16 @@ def self_test():
         (sc.startswith("[ -t 0 ] ||") and "while read -r -t 0.2 _; do :; done; " in sc, "terminal script needs a terminal on stdin and drops typed-ahead input before asking"),
         (not priv, f"no sudo/pkexec/doas/polkit/systemd/setuid tokens in code strings, bytes or f-strings {priv}"),
         (not syspath, f"no fixed system paths (/bin /etc /usr /tmp /proc /home …) in code strings {syspath}"),
-        (not fetchers, "no curl/wget in code"),
+        (not fetchers, "no curl/wget in code except the app-update line in update_command"),
+        (tar_ok, "pacman sync databases are read in memory only (gzip/io/tarfile used only inside repo_versions; no extract/extractall)"),
+        (db_ok, "the one system path is /var/lib/pacman, used only as the read-only default of the three package readers"),
+        (chain_ok, "Update all line: store app first (then a reopen note), other store apps (yay -S), Omarchy & system last (omarchy update, then 'Restart if it asks'), joined with &&"),
+        (chain_refuse, "update line refuses bad package names, repeated or unknown steps, and empty input"),
+        (vc_ok, "vercmp agrees with pacman on epochs, releases, pre-releases and separators"),
+        (upd_ok, "app-update line is exactly: download from https://omarchystore.com/downloads/, sha256sum -c, tar, ./install.sh (no root, no pipe to a shell)"),
+        (upd_refuse, "app-update refuses a malformed version or sha256"),
+        (upd_newer, "app update offered only for a strictly newer valid version; a catalog-given URL is ignored"),
+        (tag_list_refused and not ARG_RE.fullmatch(UPDATE_TAG), "the app-update tag cannot come from a catalog install command"),
         (not eval_js, f"no evaluate_javascript in the app body — only --probe below the audit line uses it {eval_js}"),
     ]
     ok = all(x for x, _ in checks)
@@ -761,5 +1255,9 @@ if __name__ == "__main__":
     if args[:1] == ["--self-test"]: sys.exit(self_test())
     if args[:1] == ["--probe"] and len(args) == 2: sys.exit(probe(args[1]))
     if args[:1] == ["--snapshot"] and len(args) == 2: sys.exit(snapshot(args[1], HOME_URL))
-    if args: print(f"omarchy-store-desktop {VERSION}\nusage: omarchy-store-desktop [--self-test | --probe <store app url> | --snapshot out.png]"); sys.exit(2)
+    if len(args) == 1 and args[0][2:] in VIEWS and args[0][:2] == "--":     # dock menu: open a view in the running app, or start with it
+        app = App(); app.register(None)
+        if app.get_is_remote(): app.activate_action("show-view", GLib.Variant("s", args[0][2:])); sys.exit(0)
+        app.start_view = args[0][2:]; sys.exit(app.run([sys.argv[0]]))
+    if args: print(f"omarchy-store-desktop {VERSION}\nusage: omarchy-store-desktop [--updates | --update-all | --installed | --self-test | --probe <store app url> | --snapshot out.png]"); sys.exit(2)
     sys.exit(App().run([sys.argv[0]]))

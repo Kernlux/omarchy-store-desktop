@@ -4,7 +4,7 @@
 # install time. check() runs the app's own --self-test (no display needed) so a package cannot be built from a
 # source that fails its security assertions.
 pkgname=omarchy-store-desktop
-pkgver=1.1.3
+pkgver=1.1.4
 pkgrel=1
 pkgdesc="Omarchy Store desktop app — installs run in your own terminal, nothing runs as root"
 arch=('any')
@@ -27,6 +27,10 @@ package() {
   install -Dm755 data/omarchy-store-desktop        "$pkgdir/usr/bin/omarchy-store-desktop"
   install -Dm644 data/com.omarchystore.Store.desktop "$pkgdir/usr/share/applications/com.omarchystore.Store.desktop"
   install -Dm644 data/com.omarchystore.Store.png   "$pkgdir/usr/share/icons/hicolor/512x512/apps/com.omarchystore.Store.png"
+  install -Dm644 data/lockup.png                   "$pkgdir/usr/share/$pkgname/lockup.png"
+  for s in 48 64 128 256; do
+    install -Dm644 "data/icons/$s.png"             "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/com.omarchystore.Store.png"
+  done
   install -Dm644 LICENSE                           "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md SECURITY.md          -t "$pkgdir/usr/share/doc/$pkgname/"
 }
