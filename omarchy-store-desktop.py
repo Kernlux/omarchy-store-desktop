@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -154,6 +154,10 @@ def parse_message(raw):
     if m.get("t") == "open":
         v = m.get("url")
         return ("open", v) if is_https_url(v) else None
+    if m.get("t") == "update":                                            # 1.1.6: the store's Updates page buttons
+        v = m.get("what")
+        if v in ("all", "store", "system"): return ("update", v)
+        return ("update", v) if isinstance(v, str) and v.startswith("app:") and ID_RE.fullmatch(v[4:]) else None
     return None
 
 
@@ -534,11 +538,18 @@ class Window(Adw.ApplicationWindow):
         ucm = WebKit.UserContentManager()
         ucm.register_script_message_handler("store", None)
         ucm.connect("script-message-received::store", self.on_message)
+        # 1.1.6: ONE read-only question the page may ask (numbers and names from the local package lists, for the store's own
+        # Updates / Installed pages). It returns data only; nothing here can start a process.
+        ucm.register_script_message_handler_with_reply("storeinfo", None)
+        ucm.connect("script-message-with-reply-received::storeinfo", self.on_info)
         # Tell the page it is inside the desktop app and give it ONE narrow bridge (top frame only).
         ucm.add_script(WebKit.UserScript.new(
             "window.__OMARCHY_DESKTOP__={version:'%s'};document.documentElement.classList.add('desktop-app');"
             "window.omarchyDesktop={install:(id)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'install',id:String(id)})),"
-            "open:(u)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'open',url:String(u)}))};" % VERSION,
+            "open:(u)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'open',url:String(u)})),"
+            "update:(w)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'update',what:String(w)})),"
+            "info:()=>window.webkit.messageHandlers.storeinfo.postMessage(JSON.stringify({t:'info'})).then(JSON.parse),"
+            "check:()=>window.webkit.messageHandlers.storeinfo.postMessage(JSON.stringify({t:'check'})).then(JSON.parse)};" % VERSION,
             WebKit.UserContentInjectedFrames.TOP_FRAME, WebKit.UserScriptInjectionTime.START,
             [f"https://{h}/*" for h in STORE_HOSTS], None))                  # injected on store pages only, never on the worker
         self.web = WebKit.WebView(network_session=ns, user_content_manager=ucm)
@@ -598,7 +609,8 @@ class Window(Adw.ApplicationWindow):
         for name, box in (("updates", self.upd_box), ("installed", self.inst_box)):
             box.set_margin_top(24); box.set_margin_bottom(24); box.set_margin_start(24); box.set_margin_end(24)
             sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER); sc.set_child(Adw.Clamp(maximum_size=900, child=box)); self.stack.add_named(sc, name)
-        body = Gtk.Box(); body.append(self.build_sidebar()); body.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)); body.append(self.stack)
+        self.nav_badges, self.nav_targets, self.sidebar_list = {}, {}, None   # 1.1.6: no native sidebar; the store page's own sidebar has Updates + Installed
+        body = Gtk.Box(); body.append(self.stack)
         self.toast = Adw.ToastOverlay(); self.toast.set_child(body); tv.set_content(self.toast)
         self.set_content(tv)
         self.web.connect("notify::title", lambda *_: self.stack.get_visible_child_name() == "web" and self.title_w.set_title(self.web.get_title() or "Omarchy Store"))
@@ -707,6 +719,7 @@ class Window(Adw.ApplicationWindow):
         if not self.take_input(): log("bridge message ignored: no recent click or key press"); return
         kind, v = msg
         if kind == "open": self.open_external(v); return
+        if kind == "update": self.page_update(v); return
         entry = self.catalog.apps.get(v)                                    # one read: the refresh thread may swap the dict under us
         argv = self.catalog.command_for(entry)
         if not argv:
@@ -763,6 +776,7 @@ class Window(Adw.ApplicationWindow):
         return sc
 
     def select_nav(self, target):
+        if self.sidebar_list is None: return
         r = next((r for r, t in self.nav_targets.items() if t == target), None)
         if r: self.sidebar_list.select_row(r)
 
@@ -773,11 +787,10 @@ class Window(Adw.ApplicationWindow):
             self.stack.set_visible_child_name("web"); self.select_nav(target); self.web.load_uri(urllib.parse.urljoin(HOME_URL, target))
 
     def show_view(self, name, focus_all=False):
+        """1.1.6: Updates and Installed are the store's own pages (same blue sidebar), filled from on_info()."""
         if name not in ("updates", "installed"): return
-        self.stack.set_visible_child_name(name); self.title_w.set_title("Updates" if name == "updates" else "Installed")
-        self.select_nav(name)
-        self.render_updates(); self.render_installed()
-        if focus_all: self.all_btn.grab_focus()
+        self.stack.set_visible_child_name("web"); self.web.load_uri(urllib.parse.urljoin(HOME_URL, f"/{name}/"))
+        self.render_updates()
 
     def check_updates(self, asked=False):
         """User-triggered (button / menu / dock action) or once when the window opens. Reads the local package database and
@@ -817,6 +830,44 @@ class Window(Adw.ApplicationWindow):
 
     def upd_total(self):
         return len(self.upd["pending"]) + (1 if self.upd["store"] else 0)
+
+    def info(self):
+        """Read-only snapshot for the store's Updates / Installed pages: bounded, plain values only."""
+        u = self.upd; apps = self.upd_apps(); st = u["store"]
+        return {"v": 1, "version": VERSION, "busy": bool(u["busy"]), "when": u["when"], "total": self.upd_total(),
+                "store": {"latest": st[0]} if st else None,
+                "apps": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]),
+                          "from": nw[next(p for p in pk if p in nw)][0], "to": nw[next(p for p in pk if p in nw)][1]} for a, pk, nw in apps][:200],
+                "system": {"count": len(u["pending"]), "list": [[n, v, w] for n, v, w in u["pending"]][:9]},
+                "installed": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]), "version": u["have"].get(pk[0], ""),
+                               "aur": m == "aur"} for a, pk, m in self.store_apps()][:2000]}
+
+    def on_info(self, ucm, value, reply):
+        try:
+            if not is_store_url(self.doc_uri or "") or not value.is_string() or len(value.to_string()) > 64: reply.return_error_message("refused"); return True
+            t = (json.loads(value.to_string()) or {}).get("t")
+            if t == "check": self.check_updates(asked=True)
+            elif t != "info": reply.return_error_message("refused"); return True
+            reply.return_value(type(value).new_string(value.get_context(), json.dumps(self.info())))   # the JSC value type, without a 7th gi import
+        except Exception as e:
+            log("info request failed:", e); reply.return_error_message("unavailable")
+        return True
+
+    def page_update(self, what):
+        """A button on the store's Updates page (already input-checked in on_message): the SAME chains the native view used."""
+        u = self.upd; apps = self.upd_apps(); st = u["store"]
+        if what == "store":
+            if st: self.run_update((("store", st[0], st[1]),), f"Update Omarchy Store to {st[0]}")
+            return
+        if what == "system": self.run_update((("system",),), "Update Omarchy & system"); return
+        if what == "all":
+            steps = (((("store", st[0], st[1]),) if st else ()) + ((("apps", tuple(sorted({p for _, pk, nw in apps for p in pk if p in nw}))),) if apps else ())
+                     + (("system",),))
+            self.run_update(steps, "Update all"); return
+        hit = next(((a, pk, nw) for a, pk, nw in apps if a["id"] == what[4:]), None)
+        if not hit: self.note("That app has no update in your last package list. Press Check for updates."); return
+        a, pk, nw = hit
+        self.run_update((("apps", tuple(p for p in pk if p in nw)),), f"Update {safe_title(a.get('name') or a['id'], a['id'])}")
 
     def run_update(self, steps, title):
         proc = open_in_terminal((UPDATE_TAG, steps), title)
@@ -1017,6 +1068,8 @@ def self_test():
         (parse_message('{"t":"exec","cmd":"ls"}') is None and parse_message('[1]') is None and parse_message('nope') is None, "unknown type / non-object / non-JSON refused"),
         (parse_message('{"t":"install","id":"' + "a" * MAX_MESSAGE + '"}') is None, "oversize message refused"),
         (parse_message(None) is None, "non-string message refused"),
+        (parse_message('{"t":"update","what":"all"}') == ("update", "all") and parse_message('{"t":"update","what":"app:btop"}') == ("update", "app:btop"), "update message parsed"),
+        (parse_message('{"t":"update","what":"app:btop;rm"}') is None and parse_message('{"t":"update","what":"root"}') is None and parse_message('{"t":"update","what":1}') is None, "bad update message refused"),
         (is_store_url(S) and is_store_url("https://www.omarchystore.com/app/btop/") and not is_store_url("https://v8.omarchy-store-preview.pages.dev/"), "store hosts accepted; the preview host is not trusted"),
         (is_store_url("https://omarchystore.com:443/x"), "explicit :443 accepted"),
         (not is_store_url("http://omarchystore.com/"), "http:// store refused for in-window nav"),
