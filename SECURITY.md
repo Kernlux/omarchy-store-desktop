@@ -150,7 +150,7 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (95 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (96 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
 string, bytes and f-string in the app body) and `python3 -m pytest tests/` (175 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of

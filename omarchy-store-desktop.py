@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -155,6 +155,13 @@ def parse_message(raw):
         v = m.get("url")
         return ("open", v) if is_https_url(v) else None
     return None
+
+
+def label_text(name, fallback):
+    """Catalog text shown ONLY in a GTK label (never in a terminal): drop control characters, keep "&" and other
+    punctuation (GTK labels here never parse markup, so "Terminal & CLI" shows as written)."""
+    t = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(name))[:60].strip()
+    return t or fallback
 
 
 def safe_title(name, fallback):
@@ -337,7 +344,7 @@ DEFAULT_CATS = [("browsers", "Browsers"), ("developer-tools", "Developer Tools")
 
 def cats(v):
     """[(id, name)] from catalog.json categories: ids checked like app ids, names plain and short."""
-    out = [(c["id"], safe_title(c["name"], c["id"])) for c in (v if isinstance(v, list) else [])[:40]
+    out = [(c["id"], label_text(c["name"], c["id"])) for c in (v if isinstance(v, list) else [])[:40]
            if isinstance(c, dict) and isinstance(c.get("id"), str) and ID_RE.fullmatch(c["id"]) and isinstance(c.get("name"), str)]
     return out
 
@@ -1039,6 +1046,7 @@ def self_test():
         (CATALOG_URL.endswith("/catalog.json") and CATALOG_URL.count("/") == 3, "catalog URL built from origin only"),
         ("\x1b" not in safe_title("btop\x1b[2J; rm -rf ~", "x") and ";" not in safe_title("a;b", "x"), "control/escape chars stripped from terminal title"),
         (safe_title("\x1b\x07", "btop") == "btop" and len(safe_title("a" * 200, "x")) == 60, "empty title falls back, length capped"),
+        (cats([{"id": "terminal", "name": "Terminal & CLI"}, {"id": "x", "name": "A\x1b[2J&B"}]) == [("terminal", "Terminal & CLI"), ("x", "A[2J&B")], "category labels keep '&', drop control chars"),
         (shlex.quote("a b;c") == "'a b;c'", "shell quoting present"),
     ]
     sc = terminal_script(["omarchy", "pkg", "add", "btop"], "Install btop")
