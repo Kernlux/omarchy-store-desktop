@@ -17,7 +17,18 @@ the *tree* are asserted by `tests/`. WebKit's own HTTP-authentication dialog is 
 401 from the store or a 407 from a proxy ends as a failed load, never as a password field inside this window.
 
 ## Executes
-Exactly one `subprocess.Popen`, in `open_in_terminal`: the user's terminal (`xdg-terminal-exec`, a hard dependency;
+Two `subprocess.Popen` sites, both asserted word for word by the self-test.
+
+**Read-only update check (1.1.7), in `read_only`:** one of three FIXED argument lists, nothing from the page or the
+catalog: `checkupdates --nocolor` (pacman-contrib: downloads fresh package lists into its own temporary copy, never
+writes the system's package database, needs no root), `yay -Qua` or `paru -Qua` (newer AUR versions of installed AUR
+packages). No shell, no environment change, stdin closed, stderr dropped, output capped at 1 MiB and parsed line by line
+against the package-name pattern; a tool that is missing or does not answer within 90 s is skipped. It runs when the
+user presses Check for updates and once when the window opens (the same moment the 1.1.4 local check ran); there is no
+timer, service or hook. It installs nothing: updates still start only from a button and Enter in the user's terminal.
+Without checkupdates the app falls back to the local package lists and the Updates page says they may be old.
+
+**Terminal, in `open_in_terminal`:** the user's terminal (`xdg-terminal-exec`, a hard dependency;
 fallbacks ghostty/alacritty/kitty/gnome-terminal/konsole/xterm) running `bash -c` of a **fixed** script that prints
 the command, waits for Enter, runs it, prints the exit code, waits again. Ctrl+C kills the script; EOF (Ctrl+D) at
 the prompt prints "Cancelled." and exits 130 — a failing `read` can never fall through into the command (it could in
@@ -150,9 +161,9 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (98 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (99 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (175 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (189 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.

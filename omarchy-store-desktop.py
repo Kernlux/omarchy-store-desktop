@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -300,6 +300,55 @@ def pending_updates(root=PACMAN_DB):
     """(installed {name: version}, [(name, installed, newer)]) — the second part equals `pacman -Qu`."""
     have, repo = installed_packages(root), repo_versions(root)
     return have, sorted((n, v, repo[n]) for n, v in have.items() if n in repo and vercmp(repo[n], v) > 0)
+
+
+# 1.1.7: the local sync databases are only as new as the user's last `pacman -Sy`, which on Omarchy is usually days old, so
+# pending_updates() said "nothing to update" while updates were waiting. The check now asks two read-only tools, when present:
+#   checkupdates --nocolor   (pacman-contrib) downloads fresh package lists into its OWN temporary copy, never touches the
+#                            system's database, needs no root; exit 0 = list printed, 2 = nothing to update
+#   yay -Qua / paru -Qua     lists newer AUR versions of installed AUR packages (read-only query of the AUR)
+# Fixed argv only (READ_ONLY), no shell, no environment changes, output bounded and parsed against PKG_RE. Nothing installs.
+READ_ONLY = {"checkupdates": ("checkupdates", "--nocolor"), "yay": ("yay", "-Qua"), "paru": ("paru", "-Qua")}
+READ_MAX = 1 << 20
+UPGRADE_RE = re.compile(r"(\S{1,81}) (\S{1,80}) -> (\S{1,80})")
+
+
+def read_only(key, timeout=90):
+    """(exit code, text) of one READ_ONLY query, or None when the tool is not installed / did not finish in time."""
+    argv = READ_ONLY[key]
+    exe = shutil.which(argv[0])
+    if not exe: return None
+    p = subprocess.Popen([exe, *argv[1:]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    try: out, _ = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill(); p.communicate(); return None
+    return p.returncode, out[:READ_MAX].decode("utf-8", "replace")
+
+
+def parse_upgrades(text):
+    """[(name, installed, newer)] from `name old -> new` lines; anything else is ignored."""
+    out = []
+    for line in (text or "").splitlines()[:5000]:
+        m = UPGRADE_RE.fullmatch(line.strip())
+        if m and PKG_RE.fullmatch(m.group(1)): out.append((m.group(1), m.group(2), m.group(3)))
+    return sorted(set(out))
+
+
+def check_pending(root=PACMAN_DB):
+    """(installed, [system upgrades], [AUR upgrades], source). source = "checked" when checkupdates ran (fresh lists),
+    "local" when it is missing or failed (then the list is only as new as the last pacman -Sy, and the page says so)."""
+    have = installed_packages(root)
+    r = read_only("checkupdates")
+    if r is not None and r[0] in (0, 2):
+        pend, src = (parse_upgrades(r[1]) if r[0] == 0 else []), "checked"
+    else:
+        pend, src = pending_updates(root)[1], "local"
+    aur = []
+    for k in ("yay", "paru"):
+        rr = read_only(k)
+        if rr is not None:
+            aur = [u for u in parse_upgrades(rr[1]) if u[0] in have]; break
+    return have, pend, aur, src
 
 
 CHAIN_NOTE = {"store": "Omarchy Store is updated: close it and open it again when this finishes.", "system": "Restart if it asks."}
@@ -615,7 +664,7 @@ class Window(Adw.ApplicationWindow):
         self.set_content(tv)
         self.web.connect("notify::title", lambda *_: self.stack.get_visible_child_name() == "web" and self.title_w.set_title(self.web.get_title() or "Omarchy Store"))
         self.web.load_uri(HOME_URL)
-        self.upd = {"have": {}, "pending": [], "store": None, "busy": False, "when": ""}
+        self.upd = {"have": {}, "pending": [], "aur": [], "source": "", "store": None, "busy": False, "when": ""}
         a = Gio.SimpleAction.new("check-update", None); a.connect("activate", lambda *_: (self.show_view("updates"), self.check_updates(asked=True))); self.add_action(a)
         self.check_updates()                                                # once, when the window opens: local package lists + the catalog copy
 
@@ -800,15 +849,16 @@ class Window(Adw.ApplicationWindow):
         if asked: self.catalog.refresh(force=True)
         res = {}
         def work():
-            try: res["have"], res["pending"] = pending_updates()
-            except Exception as e: log("package database unreadable:", e); res["have"], res["pending"] = {}, []
+            try: res["have"], res["pending"], res["aur"], res["source"] = check_pending()
+            except Exception as e: log("update check failed:", e); res["have"], res["pending"], res["aur"], res["source"] = {}, [], [], "failed"
         th = GLib.Thread.new("updates", work)
         tries = [0]
         def finish():
             tries[0] += 1
-            if ("pending" not in res or self.catalog.busy) and tries[0] < 60: return True
+            if ("pending" not in res or self.catalog.busy) and tries[0] < 400: return True   # checkupdates/yay: up to ~3 min, UI never waits
             th.join()
-            self.upd.update(have=res.get("have", {}), pending=res.get("pending", []), store=app_update(self.catalog.latest), busy=False,
+            self.upd.update(have=res.get("have", {}), pending=res.get("pending", []), aur=res.get("aur", []), source=res.get("source", ""),
+                            store=app_update(self.catalog.latest), busy=False,
                             when=GLib.DateTime.new_now_local().format("%H:%M"))
             self.render_updates(); self.render_installed()
             if asked: self.note(f"{self.upd_total()} update(s) found." if self.upd_total() else "Everything is up to date.")
@@ -825,11 +875,11 @@ class Window(Adw.ApplicationWindow):
         return sorted(out, key=lambda x: safe_title(x[0].get("name") or x[0]["id"], x[0]["id"]).lower())
 
     def upd_apps(self):
-        newer = {n: (v, w) for n, v, w in self.upd["pending"]}
-        return [(a, pk, newer) for a, pk, m in self.store_apps() if m != "aur" and any(p in newer for p in pk)]
+        newer = {n: (v, w) for n, v, w in self.upd["pending"] + self.upd["aur"]}
+        return [(a, pk, newer) for a, pk, m in self.store_apps() if any(p in newer for p in pk)]
 
     def upd_total(self):
-        return len(self.upd["pending"]) + (1 if self.upd["store"] else 0)
+        return len(self.upd["pending"]) + len(self.upd["aur"]) + (1 if self.upd["store"] else 0)
 
     def info(self):
         """Read-only snapshot for the store's Updates / Installed pages: bounded, plain values only."""
@@ -838,7 +888,11 @@ class Window(Adw.ApplicationWindow):
                 "store": {"latest": st[0]} if st else None,
                 "apps": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]),
                           "from": nw[next(p for p in pk if p in nw)][0], "to": nw[next(p for p in pk if p in nw)][1]} for a, pk, nw in apps][:200],
-                "system": {"count": len(u["pending"]), "list": [[n, v, w] for n, v, w in u["pending"]][:9]},
+                "system": {"count": len(u["pending"]), "list": [[n, v, w] for n, v, w in u["pending"]][:60]},
+                "aur": {"count": len(u["aur"]), "list": [[n, v, w] for n, v, w in u["aur"]][:60]},
+                "source": u["source"],     # "checked" = fresh lists (checkupdates); "local" = only as new as the last pacman -Sy
+                "omarchy": {"version": u["have"].get("omarchy") or u["have"].get("omarchy-dev") or "",
+                            "update": next(([v, w] for n, v, w in u["pending"] if n in ("omarchy", "omarchy-dev")), None)},
                 "installed": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]), "version": u["have"].get(pk[0], ""),
                                "aur": m == "aur"} for a, pk, m in self.store_apps()][:2000]}
 
@@ -1152,10 +1206,18 @@ def self_test():
     tar_ok = all(id(n) in db_ids for _, n in tar_refs) and not any(f.endswith((".extract", ".extractall")) for f, _ in tar_refs) \
         and sorted({f for f, _ in tar_refs}) == ["gzip", "gzip.decompress", "io", "io.BytesIO", "tarfile", "tarfile.TarError", "tarfile.open"]
     db_refs = [n for f, n in refs if f == "PACMAN_DB"]
-    db_ok = PACMAN_DB == "/var/lib/pacman" and len(db_refs) == 4   # the constant + three default arguments, nothing else
+    db_ok = PACMAN_DB == "/var/lib/pacman" and len(db_refs) == 5   # the constant + four default arguments, nothing else
     singletons = {f: [n for g, n in refs if g == f] for f in ("WebKit.UserScript.new", "Gtk.UriLauncher.new", "ucm.register_script_message_handler")}
     load_html = [f for f, _ in refs if f.endswith(("load_html", "load_plain_text", "load_bytes"))]
     popen_sites = [n for f, n in calls if f.endswith("Popen")]
+    # 1.1.7: the second Popen is read_only(): the fixed READ_ONLY argv (checkupdates / yay -Qua / paru -Qua), output to a pipe
+    RO_POPEN = "subprocess.Popen([exe, *argv[1:]], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)"
+    rof = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "read_only")
+    ro_calls = [n for f, n in calls if f == "read_only"]
+    ro_ok = (READ_ONLY == {"checkupdates": ("checkupdates", "--nocolor"), "yay": ("yay", "-Qua"), "paru": ("paru", "-Qua")}
+             and all(len(n.args) == 1 and (getattr(n.args[0], "value", None) in READ_ONLY or ast.unparse(n.args[0]) == "k") and not n.keywords for n in ro_calls)
+             and parse_upgrades("btop 1.3-1 -> 1.4-1\n;rm 1 -> 2\n-x 1 -> 2\n:: junk\nyt-dlp 2026.08.19-1 -> 2026.10.26-1") ==
+                 [("btop", "1.3-1", "1.4-1"), ("yt-dlp", "2026.08.19-1", "2026.10.26-1")])
     POPEN = "subprocess.Popen([*term, bash, '-c', terminal_script(argv, title)], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)"
     oit = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "open_in_terminal")
     popen_refs = [f for f, _ in refs if f.endswith("Popen")]
@@ -1225,8 +1287,11 @@ def self_test():
         (len(selftests) == 1 and all(id(n) in main_ids for f, n in refs if f == "self_test"), "exactly one self_test, called only from the __main__ block"),
         (not forbidden_hits, f"no eval/exec/getattr/import tricks, os.system/exec/spawn/fork/setuid, Gio.Subprocess/AppInfo, GLib.spawn, socket/ctypes/pty, raw os writes, shutil/tempfile beyond which/mkstemp, urlopen/urlretrieve {forbidden_hits}"),
         (not bad_open, f"open() only as the two-argument 'rb' read of the catalog cache {bad_open}"),
-        (len(popen_sites) == 1 and popen_sites[0] in list(ast.walk(oit)) and ast.unparse(popen_sites[0]) == POPEN and len(popen_refs) == 1,
-         "exactly one subprocess.Popen, inside open_in_terminal, with exactly the audited arguments (no shell=, no env=, no preexec_fn=)"),
+        (len(popen_sites) == 2 and len(popen_refs) == 2
+         and sum(1 for n in popen_sites if n in list(ast.walk(oit)) and ast.unparse(n) == POPEN) == 1
+         and sum(1 for n in popen_sites if n in list(ast.walk(rof)) and ast.unparse(n) == RO_POPEN) == 1,
+         "exactly two subprocess.Popen: the terminal one inside open_in_terminal and the read-only query inside read_only, each with exactly the audited arguments (no shell=, no env=, no preexec_fn=)"),
+        (ro_ok, "read-only update queries are only checkupdates --nocolor, yay -Qua, paru -Qua (fixed argv), and their output is parsed against the package-name pattern"),
         (net_pinned and len(net_opens) == 1 and getattr(net_opens[0].args[0], "id", "") == "req" and len(net_reqs) == 1
          and getattr(net_reqs[0].args[0], "id", "") == "CATALOG_URL", "exactly one network request, of CATALOG_URL, through the store-only redirect handler, all inside Catalog._refresh"),
         (imports <= ALLOWED_IMPORTS and not aliased and from_names <= {"Gtk", "Adw", "WebKit", "GLib", "Gio", "Gdk"},
