@@ -109,6 +109,11 @@ accident. Residual, accepted: Enter pressed in a store search box arms one actio
 its own, in a loop, or at load time (the review's attack page: 3 terminals + 5 browser windows in 1.1.0, nothing in
 1.1.1). The page never supplies a command, package name or flag.
 
+**The safety check first (1.1.9).** Every install, add-on and update message must carry the result of the store's
+live check (`chk`: verdict clear or caution, its time, the check names). The app refuses red, anything older than an
+hour, unknown check names or no check at all, before any lookup or terminal; the terminal prints what was checked
+(fixed words only) on its own line before it asks for Enter. See SECURITY-REVIEW-1.1.9.md.
+
 **Plugins, screensavers and themes (1.1.8).** `addon` carries only a kind and an id. The id is looked up in the app's own
 copy of the store's lists (`themes` in catalog.json, `plugins` in plugins.json) and `addon_line` builds the one line from
 that entry, every piece against a strict pattern, else refuses: a store-hosted package is `cd /tmp && curl -fLO
@@ -175,9 +180,9 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (103 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (107 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (218 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (232 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.

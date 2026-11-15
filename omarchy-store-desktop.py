@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.8"
+VERSION = "1.1.9"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -76,6 +76,7 @@ METHODS = {
 TERMINAL_SCRIPT = (
     "[ -t 0 ] || { printf 'Omarchy Store: no terminal attached, nothing was run.\\n' >&2; exit 1; }; "
     "printf '\\n  Omarchy Store  -  %%s\\n\\n' %s; "
+    "printf '  %%s\\n\\n' %s; "                                          # 1.1.8: what the store's safety check found, just before (fixed words only)
     "printf '  This will run:\\n\\n    %%s\\n\\n' %s; "
     "while read -r -t 0.2 _; do :; done; "                                 # drop anything typed ahead: the confirmation must be a fresh Enter
     "printf '  Press Enter to continue, or Ctrl+C to cancel.\\n'; read -r _ || { printf '\\n  Cancelled.\\n'; exit 130; }; "
@@ -432,21 +433,57 @@ def addon_line(kind, e):
     return f"omarchy-theme-install {GH}{g[0]}/{g[1]}" if g else None
 
 
-def terminal_script(argv, title):
+# ---- 1.1.8: the store's safety check must have run, every time, before a terminal opens ----
+# The page sends what /api/preflight found: {"v": "clear"|"caution", "at": <ISO time>, "c": ["upstream:ok", ...]}. Only a
+# verdict that allows installing, at most an hour old, made of these known check names is accepted, and the line the terminal
+# prints is built from the fixed words below — never from page text. "blocked" (red) is refused here as well as on the page.
+CHECK_WORDS = {"upstream": "source code", "license": "licence", "source": "package origin", "hooks": "install scripts",
+               "match": "package matches the listing", "maint": "maintainer", "ood": "up to date", "store": "nothing runs from the website",
+               "sha": "store package SHA-256", "market": "plugin marketplace check", "system": "Omarchy's own updater",
+               "release": "pinned release SHA-256"}
+CHECK_AT_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,3})?Z")
+CHECK_MAX_AGE = 3600     # seconds: never act on a check older than an hour
+
+
+def check_line(chk, now):
+    """The safety-check line for the terminal, or None (missing, red, malformed, unknown names, or older than an hour)."""
+    if not isinstance(chk, dict): return None
+    v, at, items = chk.get("v"), chk.get("at"), chk.get("c")
+    if v not in ("clear", "caution") or not isinstance(at, str) or not CHECK_AT_RE.fullmatch(at) or not isinstance(items, list) or not 0 < len(items) <= 24: return None
+    t = GLib.DateTime.new_from_iso8601(at, None)
+    if t is None or not -300 <= now - t.to_unix() <= CHECK_MAX_AGE: return None
+    words = []
+    for it in items:
+        k, _, st = it.partition(":") if isinstance(it, str) else ("", "", "")
+        if k not in CHECK_WORDS or st not in ("ok", "warn"): return None
+        if st == "warn" and v == "clear": return None                    # an all-clear with notes is not a check we ran
+        w = CHECK_WORDS[k] + (" ok" if st == "ok" else " (read the note)")
+        if w not in words: words.append(w)
+    return f"Safety check at {t.to_local().format('%H:%M')}, {'all clear' if v == 'clear' else 'notes read'}: " + ", ".join(words)
+
+
+def message_check(raw, now):
+    """check_line() for the 'chk' of a page message that parse_message already accepted (same size bound)."""
+    try: m = json.loads(raw)
+    except (ValueError, TypeError): return None
+    return check_line(m.get("chk"), now) if isinstance(m, dict) else None
+
+
+def terminal_script(argv, title, checked=""):
     """The exact bash -c text for this install. Every argv element must match ARG_RE (the allow-list words
     and validated package names do), so this is a hard stop, not a convenience check. The one exception is the app
     updates, (UPDATE_TAG, steps), whose line comes only from update_chain (every piece checked there)."""
     if isinstance(argv, tuple) and len(argv) == 2 and argv[0] == UPDATE_TAG:
         cmd = update_chain(argv[1])
-        return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(cmd), cmd)
+        return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(checked), shlex.quote(cmd), cmd)
     if isinstance(argv, tuple) and len(argv) == 2 and argv[0] == ADDON_TAG:       # 1.1.8: the line comes only from addon_line
         cmd = addon_line(*argv[1]) if isinstance(argv[1], tuple) and len(argv[1]) == 2 else None
         if not cmd: raise ValueError("add-on refused")
-        return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(cmd), cmd)
+        return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(checked), shlex.quote(cmd), cmd)
     if not argv or not all(isinstance(a, str) and ARG_RE.fullmatch(a) for a in argv):
         raise ValueError("argv outside allow-list")
     cmd = " ".join(shlex.quote(a) for a in argv)
-    return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(cmd), cmd)
+    return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(checked), shlex.quote(cmd), cmd)
 
 
 DEFAULT_CATS = [("browsers", "Browsers"), ("developer-tools", "Developer Tools"), ("terminal", "Terminal & CLI"), ("ai", "AI"),
@@ -570,7 +607,7 @@ def find_terminal():
     return None
 
 
-def open_in_terminal(argv, title):
+def open_in_terminal(argv, title, checked=""):
     """Open a terminal that SHOWS the command and waits for Enter. This is the only process the app body ever
     starts (--self-test additionally runs `bash -n` on the generated script). No shell=True: the terminal gets a fixed
     argv; bash gets a fixed script with quoted data.
@@ -578,7 +615,7 @@ def open_in_terminal(argv, title):
     term, bash = find_terminal(), shutil.which("bash", path=os.defpath)   # /bin:/usr/bin only, never a PATH-shadowed bash
     if not term or not bash: return None
     try:
-        return subprocess.Popen([*term, bash, "-c", terminal_script(argv, title)], start_new_session=True,
+        return subprocess.Popen([*term, bash, "-c", terminal_script(argv, title, checked)], start_new_session=True,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)   # stderr inherited: a failing launcher says why in our log
     except (OSError, ValueError) as e:
         log("terminal failed to start:", e); return False
@@ -662,10 +699,10 @@ class Window(Adw.ApplicationWindow):
         # Tell the page it is inside the desktop app and give it ONE narrow bridge (top frame only).
         ucm.add_script(WebKit.UserScript.new(
             "window.__OMARCHY_DESKTOP__={version:'%s'};document.documentElement.classList.add('desktop-app');"
-            "window.omarchyDesktop={install:(id)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'install',id:String(id)})),"
+            "window.omarchyDesktop={checks:1,install:(id,chk)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'install',id:String(id),chk})),"
             "open:(u)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'open',url:String(u)})),"
-            "update:(w)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'update',what:String(w)})),"
-            "addon:(k,id)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'addon',kind:String(k),id:String(id)})),"
+            "update:(w,chk)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'update',what:String(w),chk})),"
+            "addon:(k,id,chk)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'addon',kind:String(k),id:String(id),chk})),"
             "info:()=>window.webkit.messageHandlers.storeinfo.postMessage(JSON.stringify({t:'info'})).then(JSON.parse),"
             "check:()=>window.webkit.messageHandlers.storeinfo.postMessage(JSON.stringify({t:'check'})).then(JSON.parse)};" % VERSION,
             WebKit.UserContentInjectedFrames.TOP_FRAME, WebKit.UserScriptInjectionTime.START,
@@ -837,17 +874,20 @@ class Window(Adw.ApplicationWindow):
         if not self.take_input(): log("bridge message ignored: no recent click or key press"); return
         kind, v = msg
         if kind == "open": self.open_external(v); return
-        if kind == "update": self.page_update(v); return
-        if kind == "addon": self.page_addon(*v); return
+        checked = message_check(value.to_string(), GLib.DateTime.new_now_utc().to_unix())
+        if not checked:                                                     # 1.1.8: no terminal without a finished, recent, non-red safety check
+            log("bridge message ignored: no finished safety check"); self.note("The safety check has to finish first. Open the sheet again and wait for it."); return
+        if kind == "update": self.page_update(v, checked); return
+        if kind == "addon": self.page_addon(*v, checked); return
         entry = self.catalog.apps.get(v)                                    # one read: the refresh thread may swap the dict under us
         argv = self.catalog.command_for(entry)
         if not argv:
             self.note("The catalog could not be fetched yet — press Reload, or use the command shown on its page." if not self.catalog.apps
                       else "That listing can't be installed from here. Use the command shown on its page."); return
         name = safe_title(entry.get("name") or v, v)
-        self.run_terminal(argv, f"Install {name}")
+        self.run_terminal(argv, f"Install {name}", checked)
 
-    def page_addon(self, kind, aid):
+    def page_addon(self, kind, aid, checked):
         """1.1.8: Install in terminal on a plugin, screensaver or theme sheet (already input-checked in on_message). The id is
         looked up in OUR copy of the store's lists; the line comes only from addon_line. Nothing the page sends reaches the terminal."""
         lst = self.catalog.plugins if kind == "plugin" else self.catalog.themes
@@ -855,10 +895,10 @@ class Window(Adw.ApplicationWindow):
         if not addon_line(kind, entry):
             self.note("The store's list could not be fetched yet — press Reload, or use the command shown on its page." if not lst
                       else "That one can't be added from here. Use the command shown on its page."); return
-        self.run_terminal((ADDON_TAG, (kind, entry)), f"Add {safe_title(entry.get('n') or entry.get('name') or aid, aid)}")
+        self.run_terminal((ADDON_TAG, (kind, entry)), f"Add {safe_title(entry.get('n') or entry.get('name') or aid, aid)}", checked)
 
-    def run_terminal(self, argv, title):
-        proc = open_in_terminal(argv, title)
+    def run_terminal(self, argv, title, checked):
+        proc = open_in_terminal(argv, title, checked)
         if proc is None: self.note("No terminal emulator found. Copy the command from the app page instead."); return
         if proc is False: self.note("Your terminal could not be started (see the log). Copy the command from the app page instead."); return
         self.note(f"Opened your terminal. Read the command shown there: Enter runs it, Ctrl+C cancels.")
@@ -990,24 +1030,25 @@ class Window(Adw.ApplicationWindow):
             log("info request failed:", e); reply.return_error_message("unavailable")
         return True
 
-    def page_update(self, what):
+    def page_update(self, what, checked):
         """A button on the store's Updates page (already input-checked in on_message): the SAME chains the native view used."""
         u = self.upd; apps = self.upd_apps(); st = u["store"]
         if what == "store":
-            if st: self.run_update((("store", st[0], st[1]),), f"Update Omarchy Store to {st[0]}")
+            if st: self.run_update((("store", st[0], st[1]),), f"Update Omarchy Store to {st[0]}", checked)
             return
-        if what == "system": self.run_update((("system",),), "Update Omarchy & system"); return
+        if what == "system": self.run_update((("system",),), "Update Omarchy & system", checked); return
         if what == "all":
             steps = (((("store", st[0], st[1]),) if st else ()) + ((("apps", tuple(sorted({p for _, pk, nw in apps for p in pk if p in nw}))),) if apps else ())
                      + (("system",),))
-            self.run_update(steps, "Update all"); return
+            self.run_update(steps, "Update all", checked); return
         hit = next(((a, pk, nw) for a, pk, nw in apps if a["id"] == what[4:]), None)
         if not hit: self.note("That app has no update in your last package list. Press Check for updates."); return
         a, pk, nw = hit
-        self.run_update((("apps", tuple(p for p in pk if p in nw)),), f"Update {safe_title(a.get('name') or a['id'], a['id'])}")
+        self.run_update((("apps", tuple(p for p in pk if p in nw)),), f"Update {safe_title(a.get('name') or a['id'], a['id'])}", checked)
 
-    def run_update(self, steps, title):
-        proc = open_in_terminal((UPDATE_TAG, steps), title)
+    def run_update(self, steps, title, checked=None):
+        if not checked: self.note("Use the Updates page: the safety check runs there before anything is updated."); return   # 1.1.8: never without a check
+        proc = open_in_terminal((UPDATE_TAG, steps), title, checked)
         if not proc: self.note("No terminal could be opened. Run the command yourself: omarchy update"); return
         self.note("Opened your terminal. Read the command shown there: Enter runs it, Ctrl+C cancels.")
         GLib.timeout_add(500, lambda: proc.poll() is None)                 # reap the terminal when it exits
@@ -1301,7 +1342,7 @@ def self_test():
              and all(len(n.args) == 1 and (getattr(n.args[0], "value", None) in READ_ONLY or ast.unparse(n.args[0]) == "k") and not n.keywords for n in ro_calls)
              and parse_upgrades("btop 1.3-1 -> 1.4-1\n;rm 1 -> 2\n-x 1 -> 2\n:: junk\nyt-dlp 2026.08.19-1 -> 2026.10.26-1") ==
                  [("btop", "1.3-1", "1.4-1"), ("yt-dlp", "2026.08.19-1", "2026.10.26-1")])
-    POPEN = "subprocess.Popen([*term, bash, '-c', terminal_script(argv, title)], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)"
+    POPEN = "subprocess.Popen([*term, bash, '-c', terminal_script(argv, title, checked)], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)"
     oit = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "open_in_terminal")
     popen_refs = [f for f, _ in refs if f.endswith("Popen")]
     net_opens = [n for f, n in calls if f == "opener.open"]; net_reqs = [n for f, n in calls if f == "urllib.request.Request"]
@@ -1373,6 +1414,29 @@ def self_test():
                     and parse_message('{"t":"addon","kind":"theme","id":"gruvbox"}') == ("addon", ("theme", "gruvbox"))
                     and parse_message('{"t":"addon","kind":"app","id":"x"}') is None and parse_message('{"t":"addon","kind":["plugin"],"id":"x"}') is None
                     and parse_message('{"t":"addon","kind":"plugin","id":"a;b"}') is None and parse_message('{"t":"addon","kind":"plugin","id":"x","cmd":"id"}') == ("addon", ("plugin", "x")))
+    NOW = GLib.DateTime.new_from_iso8601("2026-11-15T07:00:00Z", None).to_unix()
+    good_chk = {"v": "clear", "at": "2026-11-15T06:40:00.123Z", "c": ["upstream:ok", "license:ok", "sha:ok", "hooks:ok", "store:ok"]}
+    cl = check_line(good_chk, NOW)
+    chk_ok = bool(cl) and cl.endswith("all clear: source code ok, licence ok, store package SHA-256 ok, install scripts ok, nothing runs from the website ok") \
+        and check_line({"v": "caution", "at": "2026-11-15T06:59:00Z", "c": ["market:warn", "upstream:ok"]}, NOW).endswith("notes read: plugin marketplace check (read the note), source code ok") \
+        and not re.search(r"[^A-Za-z0-9 ,:'()-]", cl.replace(".", "")) and message_check('{"t":"install","id":"btop","chk":%s}' % json.dumps(good_chk), NOW) == cl
+    chk_refuse = all(check_line(c, NOW) is None for c in (
+        None, {}, "clear", {"v": "blocked", "at": "2026-11-15T06:59:00Z", "c": ["source:fail"]}, {"v": "blocked", "at": "2026-11-15T06:59:00Z", "c": ["source:ok"]},
+        {"v": "clear", "at": "2026-11-15T05:59:59Z", "c": ["source:ok"]}, {"v": "clear", "at": "2026-11-15T07:06:00Z", "c": ["source:ok"]},
+        {"v": "clear", "at": "2026-11-15 06:59:00", "c": ["source:ok"]}, {"v": "clear", "at": "2026-11-15T06:59:00Z", "c": []},
+        {"v": "clear", "at": "2026-11-15T06:59:00Z", "c": ["source:ok; rm -rf ~"]}, {"v": "clear", "at": "2026-11-15T06:59:00Z", "c": ["evil:ok"]},
+        {"v": "clear", "at": "2026-11-15T06:59:00Z", "c": ["source:fail"]}, {"v": "clear", "at": "2026-11-15T06:59:00Z", "c": ["market:warn"]},
+        {"v": "clear", "at": "2026-11-15T06:59:00Z", "c": [["source", "ok"]]}, {"v": "clear", "at": "2026-11-15T06:59:00Z", "c": ["source:ok"] * 25},
+        {"v": "clear", "at": "2026-11-15T06:59:00Z\n", "c": ["source:ok"]})) and message_check('{"t":"install","id":"btop"}', NOW) is None and message_check("nope", NOW) is None
+    om = next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "on_message")
+    om_src = ast.unparse(om)
+    chk_gate_ok = (om_src.index("message_check(") < om_src.index("self.page_update(") < om_src.index("self.page_addon(") < om_src.index("self.run_terminal(")
+                   and om_src.index("if not checked:") < om_src.index("self.page_update(") and "self.page_update(v, checked)" in om_src and "self.page_addon(*v, checked)" in om_src
+                   and "self.run_terminal(argv, f'Install {name}', checked)" in om_src)
+    ru = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "run_update"))
+    chk_gate_ok = chk_gate_ok and ru.index("if not checked:") < ru.index("open_in_terminal(")
+    scc = terminal_script(["omarchy", "pkg", "add", "btop"], "Install btop", cl)
+    chk_printed = scc.index(shlex.quote(cl)) < scc.index("Press Enter") < scc.index("; omarchy pkg add btop; st=$?")
     try: terminal_script([ADDON_TAG, ("theme", {"builtin": "gruvbox"})], "t"); addon_tag_ok = False
     except (ValueError, TypeError): addon_tag_ok = not ARG_RE.fullmatch(ADDON_TAG)
     H0 = "0" * 64; ul = update_command("9.9.9", H0)
@@ -1442,6 +1506,10 @@ def self_test():
         (addon_refuse, "a crafted plugin/theme entry cannot inject: other host, '..', bad hash, quotes, $(), ;, spaces, newlines, flags, extra path parts are all refused"),
         (addon_msg_ok, "addon message parsed only for kind plugin/theme and a plain id"),
         (addon_tag_ok, "the add-on tag cannot come from a catalog install command, and terminal_script refuses an add-on it cannot build"),
+        (chk_ok, "safety check accepted only when finished, not red, under an hour old, made of known check names; the terminal line uses fixed words only"),
+        (chk_refuse, "a missing, red, stale, future, malformed or unknown-named check is refused (no terminal)"),
+        (chk_gate_ok, "on_message refuses every install / add-on / update before anything else unless message_check found a valid check, and passes that line to the terminal"),
+        (chk_printed, "the terminal prints the safety-check line before it asks for Enter"),
         (tar_ok, "pacman sync databases are read in memory only (gzip/io/tarfile used only inside repo_versions; no extract/extractall)"),
         (db_ok, "the one system path is /var/lib/pacman, used only as the read-only default of the three package readers"),
         (chain_ok, "Update all line: store app first (then a reopen note), other store apps (yay -S), Omarchy & system last (omarchy update, then 'Restart if it asks'), joined with &&"),
