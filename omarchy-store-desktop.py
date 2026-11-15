@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.9"
+VERSION = "1.1.10"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -178,6 +178,23 @@ def safe_title(name, fallback):
     could not use ANSI sequences to hide or redraw the command the user is about to confirm."""
     t = TITLE_RE.sub("", str(name))[:60].strip()
     return t or fallback
+
+
+# 1.1.10 (Luca: every start opened a blank challenges.cloudflare.com tab in his browser). The store's "I'm human" widget
+# loads a Cloudflare frame; right after a click WebKit marks that frame's navigation as user-initiated, and 1.1.1-1.1.9 sent
+# every user-initiated outside navigation to the browser. Now only a LINK the user clicked may leave the app: never a frame
+# loading (navigation type "other"), a redirect, a script or a form, and never a navigation aimed at a named (sub)frame.
+EXTERNAL_TARGETS = (None, "", "_blank", "_self", "_top", "_parent")
+
+
+def external_allowed(nav_type, gesture, redirect, frame_name):
+    """True only for a link click by the user, aimed at the window itself or a new window (WebKit gives no main-frame flag
+    for navigation actions; a subframe's own load is never LINK_CLICKED, and a link aimed at a named frame is refused)."""
+    return nav_type == WebKit.NavigationType.LINK_CLICKED and gesture is True and redirect is False and frame_name in EXTERNAL_TARGETS
+
+
+def link_click(nav):
+    return external_allowed(nav.get_navigation_type(), nav.is_user_gesture(), nav.is_redirect(), nav.get_frame_name())
 
 
 def input_is_fresh(last_input_us, now_us):
@@ -812,10 +829,10 @@ class Window(Adw.ApplicationWindow):
                     return True
                 return False                                                # default handler: load it
             decision.ignore()
-            # Clicked by the user → their browser, ONE window per click (every navigation a click handler starts carries
-            # the gesture). Not clicked (hidden iframe, redirect, script, meta refresh) → dropped. Applies to subframes too,
-            # so no third-party document ever renders in this WebView.
-            if nav.is_user_gesture() and self.take_input(): self.open_external(uri)
+            # A LINK the user clicked → their browser, ONE window per click. Anything else (a frame loading — the Cloudflare
+            # check's iframe right after a click —, a redirect, a script, a form, a meta refresh) → dropped silently. Applies to
+            # subframes too, so no third-party document ever renders in this WebView or pops up in the browser.
+            if link_click(nav) and self.take_input(): self.open_external(uri)
             return True
         if dtype == WebKit.PolicyDecisionType.RESPONSE:
             resp = decision.get_response(); uri = resp.get_uri() or ""; headers = resp.get_http_headers()
@@ -835,7 +852,7 @@ class Window(Adw.ApplicationWindow):
         URLs go to the browser if the user clicked, and the page gets no window handle either way."""
         uri = nav.get_request().get_uri() or ""
         if is_store_url(uri): self.web.load_uri(uri)
-        elif nav.is_user_gesture() and self.take_input(): self.open_external(uri)
+        elif link_click(nav) and self.take_input(): self.open_external(uri)
         return None
 
     def open_external(self, uri):
@@ -1414,6 +1431,15 @@ def self_test():
                     and parse_message('{"t":"addon","kind":"theme","id":"gruvbox"}') == ("addon", ("theme", "gruvbox"))
                     and parse_message('{"t":"addon","kind":"app","id":"x"}') is None and parse_message('{"t":"addon","kind":["plugin"],"id":"x"}') is None
                     and parse_message('{"t":"addon","kind":"plugin","id":"a;b"}') is None and parse_message('{"t":"addon","kind":"plugin","id":"x","cmd":"id"}') == ("addon", ("plugin", "x")))
+    LC, OT = WebKit.NavigationType.LINK_CLICKED, WebKit.NavigationType.OTHER
+    ext_ok = (external_allowed(LC, True, False, None) and external_allowed(LC, True, False, "_blank")
+              and not external_allowed(OT, True, False, None) and not external_allowed(LC, False, False, None) and not external_allowed(LC, True, True, None)
+              and not external_allowed(WebKit.NavigationType.FORM_SUBMITTED, True, False, None) and not external_allowed(LC, True, False, "cf-chl-widget-x")
+              and not external_allowed(LC, 1, False, None) and not external_allowed(WebKit.NavigationType.RELOAD, True, False, None))
+    pol = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "on_policy"))
+    cre = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "on_create"))
+    ext_wired = ("if link_click(nav) and self.take_input():" in pol and "elif link_click(nav) and self.take_input():" in cre
+                 and "is_user_gesture() and self.take_input()" not in pol + cre)
     NOW = GLib.DateTime.new_from_iso8601("2026-11-15T07:00:00Z", None).to_unix()
     good_chk = {"v": "clear", "at": "2026-11-15T06:40:00.123Z", "c": ["upstream:ok", "license:ok", "sha:ok", "hooks:ok", "store:ok"]}
     cl = check_line(good_chk, NOW)
@@ -1510,6 +1536,8 @@ def self_test():
         (chk_refuse, "a missing, red, stale, future, malformed or unknown-named check is refused (no terminal)"),
         (chk_gate_ok, "on_message refuses every install / add-on / update before anything else unless message_check found a valid check, and passes that line to the terminal"),
         (chk_printed, "the terminal prints the safety-check line before it asks for Enter"),
+        (ext_ok, "only a user-clicked LINK (not a redirect, not a frame loading, not a script, not aimed at a named frame) may open the browser"),
+        (ext_wired, "both outside-navigation paths (on_policy, on_create) use link_click() and nothing else opens the browser from a navigation"),
         (tar_ok, "pacman sync databases are read in memory only (gzip/io/tarfile used only inside repo_versions; no extract/extractall)"),
         (db_ok, "the one system path is /var/lib/pacman, used only as the read-only default of the three package readers"),
         (chain_ok, "Update all line: store app first (then a reopen note), other store apps (yay -S), Omarchy & system last (omarchy update, then 'Restart if it asks'), joined with &&"),

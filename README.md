@@ -112,8 +112,8 @@ Both leave `~/.config/omarchy-store` and `~/.cache/omarchy-store` for you to del
 
 ## Verify it yourself
 ```bash
-python3 -I omarchy-store-desktop.py --self-test              # 107 checks, no display, no network
-python3 -m pytest tests/                                     # 232 tests (needs python-pytest; development only)
+python3 -I omarchy-store-desktop.py --self-test              # 109 checks, no display, no network
+python3 -m pytest tests/                                     # 245 tests (needs python-pytest; development only)
 python3 omarchy-store-desktop.py --snapshot out.png          # QA: renders the store to the PNG you name (the one write outside the app dirs)
 python3 omarchy-store-desktop.py --probe https://omarchystore.com/app/btop/   # prints the argv the terminal WOULD get
 ```
