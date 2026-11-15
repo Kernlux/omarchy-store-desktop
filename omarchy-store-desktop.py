@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.10"
+VERSION = "1.1.11"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -373,14 +373,17 @@ def check_pending(root=PACMAN_DB):
     return have, pend, aur, src
 
 
-CHAIN_NOTE = {"store": "Omarchy Store is updated: close it and open it again when this finishes.", "system": "Restart if it asks."}
+CHAIN_NOTE = {"store": "Omarchy Store is updated: close it and open it again when this finishes.", "system": "Restart if it asks.",
+              # 1.1.11: a repository package is never updated on its own (that is a partial upgrade, which can break programs)
+              "repo": "This app comes from the Arch / Omarchy repositories. Updating it on its own can break other programs (a partial upgrade), so the full Omarchy & system update runs; it updates this app too."}
 CHAIN_RANK = {"store": 0, "apps": 1, "system": 2}   # Update all: the store app FIRST, then other store apps, Omarchy & system LAST
 
 
 def update_chain(steps):
     """The one line an update shows in the user's terminal. Steps (any order in, fixed order out, each at most once):
     ("store", version, sha256) -> update_command (download, sha256sum -c, install.sh) + a note to reopen the app;
-    ("apps", (pkg, ...)) -> yay -S <validated names>;  ("system",) -> omarchy update + "Restart if it asks."
+    ("apps", (pkg, ...)) -> yay -S <validated names> (AUR packages only, 1.1.11);  ("system",) -> omarchy update + "Restart if it asks.";
+    ("system", "repo") -> the same, after a line saying why a repository app is updated through the full system update.
     Joined with && so one failure stops everything after it. Nothing runs until the user presses Enter."""
     if not isinstance(steps, tuple) or not 0 < len(steps) <= 3: raise ValueError("bad steps")
     kinds = [st[0] if isinstance(st, tuple) and st else None for st in steps]
@@ -392,7 +395,8 @@ def update_chain(steps):
         elif st[0] == "apps" and len(st) == 2 and isinstance(st[1], tuple) and 0 < len(st[1]) <= MAX_PACKAGES \
                 and len(set(st[1])) == len(st[1]) and all(isinstance(p, str) and PKG_RE.fullmatch(p) for p in st[1]):
             parts.append("yay -S " + " ".join(st[1]))
-        elif st[0] == "system" and len(st) == 1:
+        elif st[0] == "system" and (len(st) == 1 or (len(st) == 2 and st[1] == "repo")):
+            if len(st) == 2: parts.append("printf '\\n  %s\\n\\n'" % CHAIN_NOTE["repo"])
             parts += ["omarchy update", "printf '\\n  %s\\n'" % CHAIN_NOTE["system"]]
         else: raise ValueError("bad step")
     return " && ".join(parts)
@@ -1018,6 +1022,10 @@ class Window(Adw.ApplicationWindow):
         newer = {n: (v, w) for n, v, w in self.upd["pending"] + self.upd["aur"]}
         return [(a, pk, newer) for a, pk, m in self.store_apps() if any(p in newer for p in pk)]
 
+    def repo_names(self):
+        """Packages with an update from the Arch / Omarchy repositories (checkupdates); everything else pending is AUR."""
+        return {n for n, v, w in self.upd["pending"]}
+
     def upd_total(self):
         return len(self.upd["pending"]) + len(self.upd["aur"]) + (1 if self.upd["store"] else 0)
 
@@ -1027,7 +1035,9 @@ class Window(Adw.ApplicationWindow):
         return {"v": 1, "version": VERSION, "busy": bool(u["busy"]), "when": u["when"], "total": self.upd_total(),
                 "store": {"latest": st[0]} if st else None,
                 "apps": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]),
-                          "from": nw[next(p for p in pk if p in nw)][0], "to": nw[next(p for p in pk if p in nw)][1]} for a, pk, nw in apps][:200],
+                          "from": nw[next(p for p in pk if p in nw)][0], "to": nw[next(p for p in pk if p in nw)][1],
+                          # 1.1.11: which packages, and whether the update needs the full system update (any repository package)
+                          "pkgs": [p for p in pk if p in nw][:20], "repo": any(p in self.repo_names() for p in pk if p in nw)} for a, pk, nw in apps][:200],
                 "system": {"count": len(u["pending"]), "list": [[n, v, w] for n, v, w in u["pending"]][:60]},
                 "aur": {"count": len(u["aur"]), "list": [[n, v, w] for n, v, w in u["aur"]][:60]},
                 "source": u["source"],     # "checked" = fresh lists (checkupdates); "local" = only as new as the last pacman -Sy
@@ -1054,14 +1064,17 @@ class Window(Adw.ApplicationWindow):
             if st: self.run_update((("store", st[0], st[1]),), f"Update Omarchy Store to {st[0]}", checked)
             return
         if what == "system": self.run_update((("system",),), "Update Omarchy & system", checked); return
-        if what == "all":
-            steps = (((("store", st[0], st[1]),) if st else ()) + ((("apps", tuple(sorted({p for _, pk, nw in apps for p in pk if p in nw}))),) if apps else ())
-                     + (("system",),))
+        repo = self.repo_names()
+        if what == "all":   # 1.1.11: yay -S only for AUR packages; repository packages are updated by the full system update (last)
+            aur = tuple(sorted({p for _, pk, nw in apps for p in pk if p in nw and p not in repo}))
+            steps = ((("store", st[0], st[1]),) if st else ()) + ((("apps", aur),) if aur else ()) + (("system",),)
             self.run_update(steps, "Update all", checked); return
         hit = next(((a, pk, nw) for a, pk, nw in apps if a["id"] == what[4:]), None)
         if not hit: self.note("That app has no update in your last package list. Press Check for updates."); return
-        a, pk, nw = hit
-        self.run_update((("apps", tuple(p for p in pk if p in nw)),), f"Update {safe_title(a.get('name') or a['id'], a['id'])}", checked)
+        a, pk, nw = hit; name = safe_title(a.get('name') or a['id'], a['id']); pend = tuple(p for p in pk if p in nw)
+        if any(p in repo for p in pend):   # never a partial upgrade: a repository app goes through the full system update
+            self.run_update((("system", "repo"),), f"Update {name} with Omarchy & system", checked); return
+        self.run_update((("apps", pend),), f"Update {name}", checked)
 
     def run_update(self, steps, title, checked=None):
         if not checked: self.note("Use the Updates page: the safety check runs there before anything is updated."); return   # 1.1.8: never without a check
@@ -1431,6 +1444,11 @@ def self_test():
                     and parse_message('{"t":"addon","kind":"theme","id":"gruvbox"}') == ("addon", ("theme", "gruvbox"))
                     and parse_message('{"t":"addon","kind":"app","id":"x"}') is None and parse_message('{"t":"addon","kind":["plugin"],"id":"x"}') is None
                     and parse_message('{"t":"addon","kind":"plugin","id":"a;b"}') is None and parse_message('{"t":"addon","kind":"plugin","id":"x","cmd":"id"}') == ("addon", ("plugin", "x")))
+    rc = update_chain((("system", "repo"),)); rp = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "page_update"))
+    try: update_chain((("system", "x"),)); bad_variant = False
+    except ValueError: bad_variant = True
+    repo_chain_ok = (rc.index("partial upgrade") < rc.index("omarchy update") and "yay" not in rc and bad_variant
+                     and "p not in repo" in rp and 'if any((p in repo for p in pend)):' in rp and "-Sy" not in json.dumps(CHAIN_NOTE) + rc)
     LC, OT = WebKit.NavigationType.LINK_CLICKED, WebKit.NavigationType.OTHER
     ext_ok = (external_allowed(LC, True, False, None) and external_allowed(LC, True, False, "_blank")
               and not external_allowed(OT, True, False, None) and not external_allowed(LC, False, False, None) and not external_allowed(LC, True, True, None)
@@ -1536,6 +1554,7 @@ def self_test():
         (chk_refuse, "a missing, red, stale, future, malformed or unknown-named check is refused (no terminal)"),
         (chk_gate_ok, "on_message refuses every install / add-on / update before anything else unless message_check found a valid check, and passes that line to the terminal"),
         (chk_printed, "the terminal prints the safety-check line before it asks for Enter"),
+        (repo_chain_ok, "a repository app's update runs the full system update with the reason shown first; yay -S never gets a repository package; never -Sy"),
         (ext_ok, "only a user-clicked LINK (not a redirect, not a frame loading, not a script, not aimed at a named frame) may open the browser"),
         (ext_wired, "both outside-navigation paths (on_policy, on_create) use link_click() and nothing else opens the browser from a navigation"),
         (tar_ok, "pacman sync databases are read in memory only (gzip/io/tarfile used only inside repo_versions; no extract/extractall)"),

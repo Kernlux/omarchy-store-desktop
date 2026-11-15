@@ -109,6 +109,10 @@ accident. Residual, accepted: Enter pressed in a store search box arms one actio
 its own, in a loop, or at load time (the review's attack page: 3 terminals + 5 browser windows in 1.1.0, nothing in
 1.1.1). The page never supplies a command, package name or flag.
 
+**No partial upgrades (1.1.11).** A store app from the Arch / Omarchy repositories is never updated on its own: its button
+runs the full Omarchy & system update (`omarchy update`) after a line saying why. `yay -S` only ever gets AUR packages.
+No command contains `-Sy`. See SECURITY-REVIEW-1.1.11.md.
+
 **Outside links (1.1.10).** Only a link the user clicked (navigation type LINK_CLICKED, a user gesture, not a redirect,
 not aimed at a named frame) is handed to the browser. A frame loading — e.g. the Cloudflare "I'm human" iframe right after
 a click, which 1.1.9 opened as a blank browser tab —, a redirect, a script or a form is dropped silently. See
@@ -185,9 +189,9 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (109 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (110 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (245 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (250 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.
