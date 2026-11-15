@@ -1,6 +1,6 @@
 pkgbase = omarchy-store-desktop
 	pkgdesc = Omarchy Store desktop app — installs run in your own terminal, nothing runs as root
-	pkgver = 1.1.10
+	pkgver = 1.1.11
 	pkgrel = 1
 	url = https://omarchystore.com
 	arch = any
@@ -14,6 +14,6 @@ pkgbase = omarchy-store-desktop
 	depends = hicolor-icon-theme
 	optdepends = flatpak: for Flatpak listings
 	source = omarchy-store-desktop-1.1.2.tar.gz
-	sha256sums = 5c97f1470f483e484115983d0a08b87d6f3307ef0e4046ba7adf070dbba2d897
+	sha256sums = fdf95037d387866ed82fbd22ec03f0387f2d998f56322268e0916aa9a95cad99
 
 pkgname = omarchy-store-desktop
