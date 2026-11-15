@@ -48,6 +48,8 @@ Source: <https://codeberg.org/kernlux/omarchy-store-desktop> (mirror: <https://g
   app's own copy of the catalog, fetched when it starts (and on Reload while it is still empty).
 - **Install** on an app's safety panel opens **your own terminal** with the exact command printed. Nothing
   runs until you press Enter; your package manager asks for your password there, in your terminal.
+- **Install in terminal** on a plugin, screensaver or theme (1.1.8) works the same way: your terminal shows the exact
+  command (download from the store, check the pinned SHA-256, unpack into `~/.config/omarchy/`, switch it on) and waits for Enter.
 - Links that leave the store open in your normal browser.
 
 ## What it never does — the no-hook promise, in plain words
@@ -67,7 +69,7 @@ Source: <https://codeberg.org/kernlux/omarchy-store-desktop> (mirror: <https://g
   your browser.
 - **Writes only to `~/.config/omarchy-store` and `~/.cache/omarchy-store`** (plus GTK's and WebKit's own caches under
   `~/.cache`). Nothing outside your home; the user-space installer adds a launcher, a menu entry and an icon under `~/.local`.
-- **No telemetry.** The program itself contacts only the store origin (for `catalog.json`); only the store and its API worker may ever load inside the window.
+- **No telemetry.** The program itself contacts only the store origin (for `catalog.json` and `plugins.json`); only the store and its API worker may ever load inside the window.
 
 The command allow-list, the URL and message validation and the terminal script are asserted by `--self-test`, which
 also audits the program's own syntax tree and fails if a shell, `eval`, `getattr`, `sudo`, `pkexec`, a second process
@@ -110,8 +112,8 @@ Both leave `~/.config/omarchy-store` and `~/.cache/omarchy-store` for you to del
 
 ## Verify it yourself
 ```bash
-python3 -I omarchy-store-desktop.py --self-test              # 99 checks, no display, no network
-python3 -m pytest tests/                                     # 189 tests (needs python-pytest; development only)
+python3 -I omarchy-store-desktop.py --self-test              # 103 checks, no display, no network
+python3 -m pytest tests/                                     # 218 tests (needs python-pytest; development only)
 python3 omarchy-store-desktop.py --snapshot out.png          # QA: renders the store to the PNG you name (the one write outside the app dirs)
 python3 omarchy-store-desktop.py --probe https://omarchystore.com/app/btop/   # prints the argv the terminal WOULD get
 ```

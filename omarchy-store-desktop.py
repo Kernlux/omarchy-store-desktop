@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -133,6 +133,7 @@ def pick_home_url(env_value):
 HOME_URL = pick_home_url(os.environ.get("OMARCHY_STORE_URL", ""))
 _o = urllib.parse.urlsplit(HOME_URL)
 CATALOG_URL = f"{_o.scheme}://{_o.netloc}/catalog.json"   # origin of HOME_URL, not HOME_URL + path
+PLUGINS_URL = f"{_o.scheme}://{_o.netloc}/plugins.json"   # 1.1.8: the plugin list (plugins + screensavers), same origin, same limits
 CONF = os.path.join(GLib.get_user_config_dir(), "omarchy-store")
 CACHE = os.path.join(GLib.get_user_cache_dir(), "omarchy-store")
 
@@ -154,6 +155,9 @@ def parse_message(raw):
     if m.get("t") == "open":
         v = m.get("url")
         return ("open", v) if is_https_url(v) else None
+    if m.get("t") == "addon":                                             # 1.1.8: a plugin / screensaver / theme sheet's Install button
+        k, v = m.get("kind"), m.get("id")
+        return ("addon", (k, v)) if isinstance(k, str) and k in ADDON_KINDS and isinstance(v, str) and ID_RE.fullmatch(v) else None
     if m.get("t") == "update":                                            # 1.1.6: the store's Updates page buttons
         v = m.get("what")
         if v in ("all", "store", "system"): return ("update", v)
@@ -376,12 +380,68 @@ def update_chain(steps):
     return " && ".join(parts)
 
 
+# ---- 1.1.8: plugins, screensavers and themes, the same one-click rule as apps ----
+ADDON_TAG = "__addon__"                     # like UPDATE_TAG: cannot match ARG_RE, so no catalog install can ever produce it
+ADDON_KINDS = ("plugin", "theme")           # screensavers are plugins in plugins.json
+GH_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")                    # one GitHub owner or repository name
+PKG_PATH_RE = re.compile(r"/theme-packages/[a-z0-9][a-z0-9._-]{0,100}\.tar\.gz")   # a package the store itself hosts
+ADDON_DIRS = {"plugin": "~/.config/omarchy/plugins", "theme": "~/.config/omarchy/themes"}
+GH = "https://github.com/"
+
+
+def _gh_parts(s):
+    """'owner/repo' -> [owner, repo] when both are plain GitHub names; anything else (a third part, '..', spaces, quotes) -> None."""
+    parts = s.split("/") if isinstance(s, str) else []
+    return parts if len(parts) == 2 and all(GH_PART_RE.fullmatch(x) and ".." not in x for x in parts) else None
+
+
+def _store_pkg(kind, d, then):
+    """Download a store-hosted package from the store's own origin, CHECK THE PINNED SHA-256, unpack into the user's own
+    folder, then one fixed Omarchy command. Only the path and the hash come from the store's list, each against a strict pattern."""
+    if not isinstance(d, dict): return None
+    url, sha = d.get("url"), d.get("sha256")
+    if not (isinstance(url, str) and PKG_PATH_RE.fullmatch(url) and ".." not in url and isinstance(sha, str) and SHA_RE.fullmatch(sha)): return None
+    f, to = url.rsplit("/", 1)[1], ADDON_DIRS[kind]
+    return (f"cd /tmp && curl -fLO {UPDATE_ORIGIN}{url} && echo \"{sha}  {f}\" | sha256sum -c - && "
+            f"mkdir -p {to} && tar -xzf {f} -C {to} && {then}")
+
+
+def addon_line(kind, e):
+    """The one line the user's terminal shows for a plugin, screensaver or theme — the same command the store page shows
+    (its lines joined with &&). Built from OUR copy of the store's lists only, every piece checked; None = refused.
+      plugin with a store package -> download + sha256sum -c + unpack + omarchy plugin enable <dir>
+      plugin from the marketplace -> omarchy plugin add https://github.com/<owner>/<repo>.git --enable
+      theme built into Omarchy    -> omarchy-theme-set <name>
+      theme with a store package  -> download + sha256sum -c + unpack + omarchy-theme-set <name>
+      theme on GitHub             -> omarchy-theme-install https://github.com/<owner>/<repo>"""
+    if not (isinstance(kind, str) and kind in ADDON_KINDS and isinstance(e, dict)): return None
+    if kind == "plugin":
+        d = e.get("pkg")
+        if d:
+            dr = d.get("dir") if isinstance(d, dict) else None
+            return _store_pkg("plugin", d, f"omarchy plugin enable {dr}") if isinstance(dr, str) and ID_RE.fullmatch(dr) else None
+        r = e.get("r")
+        g = _gh_parts(r[len(GH):]) if e.get("i") and isinstance(r, str) and r.startswith(GH) else None
+        return f"omarchy plugin add {GH}{g[0]}/{g[1]}.git --enable" if g else None
+    b = e.get("builtin")
+    if b: return f"omarchy-theme-set {b}" if isinstance(b, str) and ID_RE.fullmatch(b) else None
+    if e.get("download"):
+        n = e.get("install_name")
+        return _store_pkg("theme", e.get("download"), f"omarchy-theme-set {n}") if isinstance(n, str) and ID_RE.fullmatch(n) else None
+    g = _gh_parts(e.get("repo"))
+    return f"omarchy-theme-install {GH}{g[0]}/{g[1]}" if g else None
+
+
 def terminal_script(argv, title):
     """The exact bash -c text for this install. Every argv element must match ARG_RE (the allow-list words
     and validated package names do), so this is a hard stop, not a convenience check. The one exception is the app
     updates, (UPDATE_TAG, steps), whose line comes only from update_chain (every piece checked there)."""
     if isinstance(argv, tuple) and len(argv) == 2 and argv[0] == UPDATE_TAG:
         cmd = update_chain(argv[1])
+        return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(cmd), cmd)
+    if isinstance(argv, tuple) and len(argv) == 2 and argv[0] == ADDON_TAG:       # 1.1.8: the line comes only from addon_line
+        cmd = addon_line(*argv[1]) if isinstance(argv[1], tuple) and len(argv[1]) == 2 else None
+        if not cmd: raise ValueError("add-on refused")
         return TERMINAL_SCRIPT % (shlex.quote(title), shlex.quote(cmd), cmd)
     if not argv or not all(isinstance(a, str) and ARG_RE.fullmatch(a) for a in argv):
         raise ValueError("argv outside allow-list")
@@ -414,7 +474,7 @@ class Catalog:
     """Local copy of the public catalog, used ONLY to map an app id → install method + package names.
     Fetched over TLS from the store origin at start; written atomically with owner-only permissions."""
     def __init__(self):
-        self.apps = {}; self.latest = None; self.categories = []; self.busy = False; self.last_try = -REFRESH_GAP_US
+        self.apps = {}; self.plugins = {}; self.themes = {}; self.latest = None; self.categories = []; self.busy = False; self.last_try = -REFRESH_GAP_US
         try: self.path = os.path.join(private_dir(CACHE), "catalog.json"); self._load()
         except OSError as e: log("cache directory unusable, running without a catalog:", e); self.path = None
 
@@ -429,42 +489,50 @@ class Catalog:
 
     @classmethod
     def from_apps(cls, apps):
-        c = cls.__new__(cls); c.path = None; c.apps = {}; c.latest = None; c.categories = []; c._set(apps); return c
+        c = cls.__new__(cls); c.path = None; c.apps = {}; c.plugins = {}; c.themes = {}; c.latest = None; c.categories = []; c._set(apps); return c
 
-    def _set(self, apps):
+    @staticmethod
+    def by_id(items):
         out = {}
-        for a in (apps if isinstance(apps, list) else []):
+        for a in (items if isinstance(items, list) else []):
             if not (isinstance(a, dict) and isinstance(a.get("id"), str)): continue
             if a["id"] in out: log("duplicate catalog id ignored:", a["id"][:64]); continue   # first wins, loudly
             out[a["id"]] = a
-        self.apps = out
+        return out
+
+    def _set(self, apps):
+        self.apps = self.by_id(apps)
 
     def _load(self):
         try:
             with open(self.path, "rb") as f: j = json.load(f)
-            self._set(j.get("apps", [])); self.latest = j.get("desktop_latest"); self.categories = cats(j.get("categories"))
+            self._set(j.get("apps", [])); self.themes = self.by_id(j.get("themes")); self.latest = j.get("desktop_latest"); self.categories = cats(j.get("categories"))
         except Exception: self.apps = {}                                 # it is a cache: anything unreadable means "no catalog"
 
     def _refresh(self):
         tmp = None
         try:
-            req = urllib.request.Request(CATALOG_URL, headers={"User-Agent": f"OmarchyStore-desktop/{VERSION}"})
             opener = urllib.request.build_opener(StoreRedirectHandler)   # default context: TLS + hostname verified
-            with opener.open(req, timeout=20) as r:
-                if not is_store_url(r.geturl()): raise ValueError("redirected off the store")
-                data, t0 = b"", GLib.get_monotonic_time()
-                while len(data) <= MAX_CATALOG:                              # bounded size AND bounded time
-                    chunk = r.read1(1 << 16)                                 # read1: returns after ONE socket read, so a drip cannot stall the deadline check
-                    if not chunk: break
-                    data += chunk
-                    if GLib.get_monotonic_time() - t0 > FETCH_DEADLINE_US: raise ValueError("catalog fetch too slow")
-            if len(data) > MAX_CATALOG: raise ValueError("catalog too large")
-            j = json.loads(data)
-            if not isinstance(j, dict) or not isinstance(j.get("apps"), list): raise ValueError("not a catalog")
-            fd, tmp = tempfile.mkstemp(dir=CACHE, prefix=".catalog-")  # random name, 0600, O_EXCL: no symlink games
-            with os.fdopen(fd, "wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
-            os.replace(tmp, self.path); tmp = None
-            self._set(j["apps"]); self.latest = j.get("desktop_latest"); self.categories = cats(j.get("categories")); log("catalog refreshed:", len(self.apps), "apps")   # the tree we validated, parsed once
+            for url in (CATALOG_URL, PLUGINS_URL):                       # 1.1.8: the plugin list too, after the catalog, same limits
+                req = urllib.request.Request(url, headers={"User-Agent": f"OmarchyStore-desktop/{VERSION}"})
+                with opener.open(req, timeout=20) as r:
+                    if not is_store_url(r.geturl()): raise ValueError("redirected off the store")
+                    data, t0 = b"", GLib.get_monotonic_time()
+                    while len(data) <= MAX_CATALOG:                          # bounded size AND bounded time
+                        chunk = r.read1(1 << 16)                             # read1: returns after ONE socket read, so a drip cannot stall the deadline check
+                        if not chunk: break
+                        data += chunk
+                        if GLib.get_monotonic_time() - t0 > FETCH_DEADLINE_US: raise ValueError("catalog fetch too slow")
+                if len(data) > MAX_CATALOG: raise ValueError("catalog too large")
+                j = json.loads(data)
+                if url == PLUGINS_URL:                                       # kept in memory only (never written): used only by addon_line
+                    if not isinstance(j, dict) or not isinstance(j.get("plugins"), list): raise ValueError("not a plugin list")
+                    self.plugins = self.by_id(j["plugins"]); log("plugin list refreshed:", len(self.plugins), "plugins"); continue
+                if not isinstance(j, dict) or not isinstance(j.get("apps"), list): raise ValueError("not a catalog")
+                fd, tmp = tempfile.mkstemp(dir=CACHE, prefix=".catalog-")  # random name, 0600, O_EXCL: no symlink games
+                with os.fdopen(fd, "wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
+                os.replace(tmp, self.path); tmp = None
+                self._set(j["apps"]); self.themes = self.by_id(j.get("themes")); self.latest = j.get("desktop_latest"); self.categories = cats(j.get("categories")); log("catalog refreshed:", len(self.apps), "apps")   # the tree we validated, parsed once
         except Exception as e:                                           # offline is normal; the app still works
             log("catalog refresh skipped:", e)
             if tmp:
@@ -597,6 +665,7 @@ class Window(Adw.ApplicationWindow):
             "window.omarchyDesktop={install:(id)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'install',id:String(id)})),"
             "open:(u)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'open',url:String(u)})),"
             "update:(w)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'update',what:String(w)})),"
+            "addon:(k,id)=>window.webkit.messageHandlers.store.postMessage(JSON.stringify({t:'addon',kind:String(k),id:String(id)})),"
             "info:()=>window.webkit.messageHandlers.storeinfo.postMessage(JSON.stringify({t:'info'})).then(JSON.parse),"
             "check:()=>window.webkit.messageHandlers.storeinfo.postMessage(JSON.stringify({t:'check'})).then(JSON.parse)};" % VERSION,
             WebKit.UserContentInjectedFrames.TOP_FRAME, WebKit.UserScriptInjectionTime.START,
@@ -769,13 +838,27 @@ class Window(Adw.ApplicationWindow):
         kind, v = msg
         if kind == "open": self.open_external(v); return
         if kind == "update": self.page_update(v); return
+        if kind == "addon": self.page_addon(*v); return
         entry = self.catalog.apps.get(v)                                    # one read: the refresh thread may swap the dict under us
         argv = self.catalog.command_for(entry)
         if not argv:
             self.note("The catalog could not be fetched yet — press Reload, or use the command shown on its page." if not self.catalog.apps
                       else "That listing can't be installed from here. Use the command shown on its page."); return
         name = safe_title(entry.get("name") or v, v)
-        proc = open_in_terminal(argv, f"Install {name}")
+        self.run_terminal(argv, f"Install {name}")
+
+    def page_addon(self, kind, aid):
+        """1.1.8: Install in terminal on a plugin, screensaver or theme sheet (already input-checked in on_message). The id is
+        looked up in OUR copy of the store's lists; the line comes only from addon_line. Nothing the page sends reaches the terminal."""
+        lst = self.catalog.plugins if kind == "plugin" else self.catalog.themes
+        entry = lst.get(aid)                                                # one read: the refresh thread may swap the dict under us
+        if not addon_line(kind, entry):
+            self.note("The store's list could not be fetched yet — press Reload, or use the command shown on its page." if not lst
+                      else "That one can't be added from here. Use the command shown on its page."); return
+        self.run_terminal((ADDON_TAG, (kind, entry)), f"Add {safe_title(entry.get('n') or entry.get('name') or aid, aid)}")
+
+    def run_terminal(self, argv, title):
+        proc = open_in_terminal(argv, title)
         if proc is None: self.note("No terminal emulator found. Copy the command from the app page instead."); return
         if proc is False: self.note("Your terminal could not be started (see the log). Copy the command from the app page instead."); return
         self.note(f"Opened your terminal. Read the command shown there: Enter runs it, Ctrl+C cancels.")
@@ -1252,7 +1335,46 @@ def self_test():
     # 1.1.4: the ONE allowed fetch word is the curl inside update_command (the line the user's terminal shows for an app update)
     upd_fn = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "update_command")
     upd_strs = set(consts(update_command.__code__, [])) | {"".join(v.value if isinstance(v, ast.Constant) else "" for v in n.values) for n in ast.walk(upd_fn) if isinstance(n, ast.JoinedStr)}
+    pkg_fn = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "_store_pkg")
+    upd_strs |= set(consts(_store_pkg.__code__, [])) | {"".join(v.value if isinstance(v, ast.Constant) else "" for v in n.values) for n in ast.walk(pkg_fn) if isinstance(n, ast.JoinedStr)}
     fetchers = [x for x in strs if re.search(r"\b(curl|wget)\b", x) and x not in upd_strs]
+    rf = next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "_refresh")
+    loops = [n for n in ast.walk(rf) if isinstance(n, ast.For)]
+    fetch_loop_ok = len(loops) == 1 and ast.unparse(loops[0].target) == "url" and ast.unparse(loops[0].iter) == "(CATALOG_URL, PLUGINS_URL)" \
+        and all(n in list(ast.walk(loops[0])) for n in net_reqs + net_opens)
+    # 1.1.8 add-ons: good entries give exactly the page's lines; crafted ones are refused
+    SH = "a" * 64; SP = "https://omarchystore.com/theme-packages/"
+    good = [("plugin", {"id": "omarchy-store-screensaver", "i": 1, "pkg": {"url": "/theme-packages/omarchy-store-screensaver-1.3.0.tar.gz", "sha256": SH, "dir": "omarchy-store-screensaver"}},
+             f'cd /tmp && curl -fLO {SP}omarchy-store-screensaver-1.3.0.tar.gz && echo "{SH}  omarchy-store-screensaver-1.3.0.tar.gz" | sha256sum -c - && mkdir -p ~/.config/omarchy/plugins && tar -xzf omarchy-store-screensaver-1.3.0.tar.gz -C ~/.config/omarchy/plugins && omarchy plugin enable omarchy-store-screensaver'),
+            ("plugin", {"id": "x", "i": 1, "r": "https://github.com/LetsFG/LetsFG"}, "omarchy plugin add https://github.com/LetsFG/LetsFG.git --enable"),
+            ("theme", {"id": "gruvbox", "builtin": "gruvbox"}, "omarchy-theme-set gruvbox"),
+            ("theme", {"id": "omarchy-store", "install_name": "omarchy-store", "download": {"url": "/theme-packages/omarchy-store-theme-1.0.0.tar.gz", "sha256": SH}},
+             f'cd /tmp && curl -fLO {SP}omarchy-store-theme-1.0.0.tar.gz && echo "{SH}  omarchy-store-theme-1.0.0.tar.gz" | sha256sum -c - && mkdir -p ~/.config/omarchy/themes && tar -xzf omarchy-store-theme-1.0.0.tar.gz -C ~/.config/omarchy/themes && omarchy-theme-set omarchy-store'),
+            ("theme", {"id": "aamis", "repo": "vyrx-dev/omarchy-aamis-theme"}, "omarchy-theme-install https://github.com/vyrx-dev/omarchy-aamis-theme")]
+    addon_ok = all(addon_line(k, e) == want for k, e, want in good) and all(
+        subprocess.run([shutil.which("bash"), "-n", "-c", terminal_script((ADDON_TAG, (k, e)), "Add x")], capture_output=True).returncode == 0 for k, e, _ in good) if shutil.which("bash") else False
+    P = lambda **kw: {"id": "p", "i": 1, "pkg": {"url": "/theme-packages/a-1.tar.gz", "sha256": SH, "dir": "a", **kw}}
+    bad = [("plugin", P(url="https://evil.com/theme-packages/a.tar.gz")), ("plugin", P(url="/theme-packages/../a.tar.gz")), ("plugin", P(url="/downloads/a.tar.gz")),
+           ("plugin", P(url="/theme-packages/a.tar.gz;id")), ("plugin", P(url="/theme-packages/a$(id).tar.gz")), ("plugin", P(url="/theme-packages/a.tar.gz\n")),
+           ("plugin", P(sha256="A" * 64)), ("plugin", P(sha256=SH[:63])), ("plugin", P(sha256=SH + '" ; id ; "')), ("plugin", P(dir="a b")), ("plugin", P(dir="a;id")),
+           ("plugin", P(dir="-x")), ("plugin", P(dir="../x")), ("plugin", P(dir=None)), ("plugin", {"id": "p", "i": 1, "pkg": "x"}),
+           ("plugin", {"id": "p", "i": 1, "r": "https://github.com/a/b/c"}), ("plugin", {"id": "p", "i": 1, "r": "https://github.com/a/b;id"}),
+           ("plugin", {"id": "p", "i": 1, "r": "https://github.com/a/$(id)"}), ("plugin", {"id": "p", "i": 1, "r": "https://github.com/../b"}),
+           ("plugin", {"id": "p", "i": 1, "r": "https://evil.com/a/b"}), ("plugin", {"id": "p", "i": 1, "r": "https://github.com/a/b c"}),
+           ("plugin", {"id": "p", "i": 1, "r": "https://github.com/-a/b"}), ("plugin", {"id": "p", "r": "https://github.com/a/b"}),
+           ("theme", {"id": "t", "builtin": "x; id"}), ("theme", {"id": "t", "builtin": "--help"}), ("theme", {"id": "t", "install_name": "a b", "download": {"url": "/theme-packages/a.tar.gz", "sha256": SH}}),
+           ("theme", {"id": "t", "install_name": "a", "download": {"url": "/theme-packages/a.tar.gz", "sha256": "x"}}), ("theme", {"id": "t", "repo": "a/b'c"}), ("theme", {"id": "t", "repo": "a"}),
+           ("theme", {"id": "t", "repo": "a/b\n"}), ("theme", {"id": "t"}), ("theme", None), ("app", {"id": "x", "builtin": "a"}), (None, {}), ("plugin", "x")]
+    addon_refuse = all(addon_line(k, e) is None for k, e in bad)
+    for k, e in bad[:6]:
+        try: terminal_script((ADDON_TAG, (k, e)), "t"); addon_refuse = False
+        except ValueError: pass
+    addon_msg_ok = (parse_message('{"t":"addon","kind":"plugin","id":"omarchy-store-screensaver"}') == ("addon", ("plugin", "omarchy-store-screensaver"))
+                    and parse_message('{"t":"addon","kind":"theme","id":"gruvbox"}') == ("addon", ("theme", "gruvbox"))
+                    and parse_message('{"t":"addon","kind":"app","id":"x"}') is None and parse_message('{"t":"addon","kind":["plugin"],"id":"x"}') is None
+                    and parse_message('{"t":"addon","kind":"plugin","id":"a;b"}') is None and parse_message('{"t":"addon","kind":"plugin","id":"x","cmd":"id"}') == ("addon", ("plugin", "x")))
+    try: terminal_script([ADDON_TAG, ("theme", {"builtin": "gruvbox"})], "t"); addon_tag_ok = False
+    except (ValueError, TypeError): addon_tag_ok = not ARG_RE.fullmatch(ADDON_TAG)
     H0 = "0" * 64; ul = update_command("9.9.9", H0)
     upd_ok = (ul == f'mkdir -p ~/Downloads && cd ~/Downloads && curl -fLO https://omarchystore.com/downloads/omarchy-store-desktop-9.9.9.tar.gz && echo "{H0}  omarchy-store-desktop-9.9.9.tar.gz" | sha256sum -c && tar xf omarchy-store-desktop-9.9.9.tar.gz && cd omarchy-store-desktop-9.9.9 && ./install.sh'
               and UPDATE_ORIGIN == "https://omarchystore.com")
@@ -1292,8 +1414,9 @@ def self_test():
          and sum(1 for n in popen_sites if n in list(ast.walk(rof)) and ast.unparse(n) == RO_POPEN) == 1,
          "exactly two subprocess.Popen: the terminal one inside open_in_terminal and the read-only query inside read_only, each with exactly the audited arguments (no shell=, no env=, no preexec_fn=)"),
         (ro_ok, "read-only update queries are only checkupdates --nocolor, yay -Qua, paru -Qua (fixed argv), and their output is parsed against the package-name pattern"),
-        (net_pinned and len(net_opens) == 1 and getattr(net_opens[0].args[0], "id", "") == "req" and len(net_reqs) == 1
-         and getattr(net_reqs[0].args[0], "id", "") == "CATALOG_URL", "exactly one network request, of CATALOG_URL, through the store-only redirect handler, all inside Catalog._refresh"),
+        (net_pinned and len(net_opens) == 1 and getattr(net_opens[0].args[0], "id", "") == "req" and len(net_reqs) == 1 and getattr(net_reqs[0].args[0], "id", "") == "url"
+         and fetch_loop_ok and CATALOG_URL.endswith("/catalog.json") and PLUGINS_URL == CATALOG_URL[:-len("catalog.json")] + "plugins.json",
+         "exactly one network request site, fetching only CATALOG_URL then PLUGINS_URL (both on the store origin), through the store-only redirect handler, all inside Catalog._refresh"),
         (imports <= ALLOWED_IMPORTS and not aliased and from_names <= {"Gtk", "Adw", "WebKit", "GLib", "Gio", "Gdk"},
          f"imports limited to {sorted(ALLOWED_IMPORTS)}, no aliases, only the six gi namespaces (got {sorted(imports - ALLOWED_IMPORTS)} {aliased} {sorted(from_names - {'Gtk', 'Adw', 'WebKit', 'GLib', 'Gio', 'Gdk'})})"),
         (sock_ok, "socket is used only inside hypr_ask, AF_UNIX stream only (the user's own compositor socket)"),
@@ -1314,7 +1437,11 @@ def self_test():
         (sc.startswith("[ -t 0 ] ||") and "while read -r -t 0.2 _; do :; done; " in sc, "terminal script needs a terminal on stdin and drops typed-ahead input before asking"),
         (not priv, f"no sudo/pkexec/doas/polkit/systemd/setuid tokens in code strings, bytes or f-strings {priv}"),
         (not syspath, f"no fixed system paths (/bin /etc /usr /tmp /proc /home …) in code strings {syspath}"),
-        (not fetchers, "no curl/wget in code except the app-update line in update_command"),
+        (not fetchers, "no curl/wget in code except the app-update line in update_command and the store-package line in _store_pkg"),
+        (addon_ok, "add-on lines are exactly the store page's commands: store package (store origin, pinned sha256, sha256sum -c, unpack to ~/.config/omarchy/...), omarchy plugin add/enable, omarchy-theme-set/-install"),
+        (addon_refuse, "a crafted plugin/theme entry cannot inject: other host, '..', bad hash, quotes, $(), ;, spaces, newlines, flags, extra path parts are all refused"),
+        (addon_msg_ok, "addon message parsed only for kind plugin/theme and a plain id"),
+        (addon_tag_ok, "the add-on tag cannot come from a catalog install command, and terminal_script refuses an add-on it cannot build"),
         (tar_ok, "pacman sync databases are read in memory only (gzip/io/tarfile used only inside repo_versions; no extract/extractall)"),
         (db_ok, "the one system path is /var/lib/pacman, used only as the read-only default of the three package readers"),
         (chain_ok, "Update all line: store app first (then a reopen note), other store apps (yay -S), Omarchy & system last (omarchy update, then 'Restart if it asks'), joined with &&"),

@@ -64,6 +64,8 @@ left to the owner.
   may load as a *document* in the **main frame**. Subframes may hold `STORE_HOSTS` documents only — the message handler
   is reachable from every frame, so the worker (which gets no bridge, no catalog and no home-page trust, and no injected
   helper script) is never allowed to be a frame inside a store page.
+- `https://<store origin>/plugins.json` (1.1.8), right after catalog.json with the same rules (store-only redirects, 20 MiB,
+  60 s), kept in memory only (never written), used only to look up a plugin or screensaver for `addon_line`.
 - `https://<store origin>/catalog.json` once at start: TLS and hostname verified by Python's default context, 20 s
   timeout, **a redirect that leaves the store over https is refused before it is followed** (no other host is ever
   contacted), 20 MiB cap and a 60 s deadline for the whole download (read in single socket reads, so a slow drip
@@ -76,7 +78,7 @@ left to the owner.
   elsewhere — are governed by WebKit and the storefront's CSP, not by this app's navigation policy, which decides
   which *documents* may render. `<a ping>` hyperlink auditing cannot be switched off in WebKitGTK API 6.0 (the setting
   is a deprecated no-op; 1.1.1 no longer calls it): such pings are click-initiated subresource requests, like any image
-  the page loads. No telemetry: this program itself contacts only the store origin, for `catalog.json`.
+  the page loads. No telemetry: this program itself contacts only the store origin, for `catalog.json` and `plugins.json`.
 - App updates (1.1.4): no automatic download and no background check. When the window opens, or when the user picks
   "Check for app update", the app reads `desktop_latest` from the catalog it already fetched; only `version`
   (`N.N.N`) and `sha256` (64 hex) are used, a catalog-given URL is ignored. If the version is newer, the header shows
@@ -96,7 +98,7 @@ One `webkit.messageHandlers.store` channel. The helper `window.omarchyDesktop` i
 pages (user-script allow-list), top frame only. A message is dropped unless **all** of: the **committed** document's URL
 is a `STORE_HOSTS` URL (not the view's active URL, which already names a pending navigation while the previous document
 still runs — nothing may use the bridge before the first commit); the value is a string of ≤ 4096 chars that parses as a JSON object; it is
-`{"t":"install","id":<id matching ID_RE>}` or `{"t":"open","url":<plain https URL with a host, no userinfo, no
+`{"t":"install","id":<id matching ID_RE>}`, `{"t":"addon","kind":"plugin"|"theme","id":<id matching ID_RE>}` (1.1.8), `{"t":"update",…}` (1.1.6) or `{"t":"open","url":<plain https URL with a host, no userinfo, no
 whitespace or control characters, ≤ 2048 chars>}`; **and GTK itself saw a click/tap, or an Enter key press, on the
 view within the last 3 s — each press pays for exactly one action (one terminal, or one browser window, also for
 ordinary outside links), and the press dies the moment a new document commits in the window**, so the page a click
@@ -106,6 +108,18 @@ any typed-ahead input before it asks for Enter, so a terminal that appears while
 accident. Residual, accepted: Enter pressed in a store search box arms one action for 3 s. A page therefore cannot open a terminal or the browser on
 its own, in a loop, or at load time (the review's attack page: 3 terminals + 5 browser windows in 1.1.0, nothing in
 1.1.1). The page never supplies a command, package name or flag.
+
+**Plugins, screensavers and themes (1.1.8).** `addon` carries only a kind and an id. The id is looked up in the app's own
+copy of the store's lists (`themes` in catalog.json, `plugins` in plugins.json) and `addon_line` builds the one line from
+that entry, every piece against a strict pattern, else refuses: a store-hosted package is `cd /tmp && curl -fLO
+https://omarchystore.com/theme-packages/<name>.tar.gz && echo "<pinned sha256>  <name>.tar.gz" | sha256sum -c - &&
+mkdir -p ~/.config/omarchy/<plugins|themes> && tar -xzf <name>.tar.gz -C <that folder> && omarchy plugin enable <dir>` /
+`omarchy-theme-set <name>` (fixed origin, path `/theme-packages/[a-z0-9][a-z0-9._-]*.tar.gz`, 64 lower-case hex, the hash
+is checked BEFORE anything is unpacked); a marketplace plugin is `omarchy plugin add https://github.com/<owner>/<repo>.git
+--enable`; a theme is `omarchy-theme-set <name>` (built in) or `omarchy-theme-install https://github.com/<owner>/<repo>`.
+Owner/repo/name/dir must be plain names (no `/`, `..`, spaces, quotes, `$`, `;`, leading `-`). It is the same line the
+store page shows, and it goes through the same terminal script, input gate and Enter confirmation as an app install. The
+app itself never downloads or saves the package; the user's own shell does, after Enter.
 
 ## WebKit hardening
 - Navigation policy: documents only from `WEBVIEW_HOSTS` over https (no userinfo, port 443 only), plus
@@ -161,9 +175,9 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (99 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (103 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (189 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (218 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.
