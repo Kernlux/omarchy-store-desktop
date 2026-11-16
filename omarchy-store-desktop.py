@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.11"
+VERSION = "1.1.12"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -212,6 +212,34 @@ UPDATE_TAG = "__update_app__"                 # cannot match ARG_RE (leading "_"
 
 def vtuple(v):
     return tuple(int(x) for x in v.split("."))
+
+
+# 1.1.12 (Luca, 15 Nov: updated to 1.1.11, the store still said "you have 1.1.9"). The app is single-instance: after an
+# update, opening it from the launcher only brings the OLD running process forward until the user really quits it. The app
+# now reads the VERSION line of its own file on disk (read-only, first 64 KiB) and, when that is newer than the running
+# code, offers ONE Restart button. Restart = quit this instance, then start the same file once (fixed argv, no shell).
+SELF_FILE = os.path.abspath(__file__)
+SELF_VER_RE = re.compile(r'^VERSION = "([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})"$', re.M)
+
+
+def installed_version(path=SELF_FILE):
+    """The version of the app file on disk now (an update may have replaced it while this process runs); "" if unreadable."""
+    try:
+        with open(path, "rb") as f: head = f.read(65536).decode("utf-8", "replace")
+    except OSError: return ""
+    m = SELF_VER_RE.search(head)
+    return m.group(1) if m else ""
+
+
+def restart_pending(path=SELF_FILE):
+    """The newer installed version when the file on disk is newer than the code running now, else ""."""
+    v = installed_version(path)
+    return v if v and vtuple(v) > vtuple(VERSION) else ""
+
+
+def relaunch():
+    """Only after the user pressed Restart and this instance has shut down: start the updated app file once."""
+    return subprocess.Popen([sys.executable, "-I", SELF_FILE], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def app_update(latest):
@@ -779,6 +807,8 @@ class Window(Adw.ApplicationWindow):
         hb.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
         self.title_w = Adw.WindowTitle(title="Omarchy Store", subtitle="installs run in your terminal · nothing runs in the background")
         hb.set_title_widget(self.title_w); tv.add_top_bar(hb)
+        self.restart_bar = Adw.Banner(revealed=False, button_label="Restart")     # 1.1.12: the app file on disk is newer than this process
+        self.restart_bar.connect("button-clicked", lambda *_: app.restart_now()); tv.add_top_bar(self.restart_bar)
         self.stack = Gtk.Stack(hexpand=True, vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE)
         self.stack.add_named(self.web, "web")
         self.upd_box, self.inst_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14), Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -794,6 +824,10 @@ class Window(Adw.ApplicationWindow):
         self.upd = {"have": {}, "pending": [], "aur": [], "source": "", "store": None, "busy": False, "when": ""}
         a = Gio.SimpleAction.new("check-update", None); a.connect("activate", lambda *_: (self.show_view("updates"), self.check_updates(asked=True))); self.add_action(a)
         self.check_updates()                                                # once, when the window opens: local package lists + the catalog copy
+
+    def show_restart(self, v):
+        self.restart_bar.set_title(f"Omarchy Store was updated to {v}. Restart to use it.")
+        self.restart_bar.set_revealed(True)
 
     def toggle_max(self):
         if not hypr_window("maximize"):                                    # other desktops honour the toolkit's request
@@ -1032,7 +1066,7 @@ class Window(Adw.ApplicationWindow):
     def info(self):
         """Read-only snapshot for the store's Updates / Installed pages: bounded, plain values only."""
         u = self.upd; apps = self.upd_apps(); st = u["store"]
-        return {"v": 1, "version": VERSION, "busy": bool(u["busy"]), "when": u["when"], "total": self.upd_total(),
+        return {"v": 1, "version": VERSION, "installed": installed_version() or VERSION, "busy": bool(u["busy"]), "when": u["when"], "total": self.upd_total(),
                 "store": {"latest": st[0]} if st else None,
                 "apps": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]),
                           "from": nw[next(p for p in pk if p in nw)][0], "to": nw[next(p for p in pk if p in nw)][1],
@@ -1172,6 +1206,16 @@ class App(Adw.Application):
         self.start_view = None
         v = Gio.SimpleAction.new("show-view", GLib.VariantType.new("s")); v.connect("activate", lambda _a, p: self.open_view(p.get_string())); self.add_action(v)
         self.set_accels_for_action("app.quit", ["<Primary>q"])
+        self.restart = False
+        r = Gio.SimpleAction.new("restart", None); r.connect("activate", lambda *_: self.restart_now()); self.add_action(r)
+
+    def restart_now(self):
+        """The Restart button: quit this (old) instance; __main__ then starts the updated file once (relaunch)."""
+        self.restart = True; self.quit()
+
+    def check_restart(self):
+        v = restart_pending(); w = self.props.active_window
+        if v and w: w.show_restart(v)
 
     def do_startup(self):
         """Runs in the primary instance only (GApplication uniqueness): a second launch never refetches the catalog."""
@@ -1182,14 +1226,14 @@ class App(Adw.Application):
         win = self.props.active_window
         if win is None: win = Window(self, self.catalog)
         else: hypr_window("bring_back")                                    # a second launch brings a window a dock had hidden back to this workspace
-        win.present()
+        win.present(); self.check_restart()                               # 1.1.12: at start and on every activation
         if self.start_view: v, self.start_view = self.start_view, None; self.open_view(v)
 
     def open_view(self, view):
         """Dock / launcher actions (Desktop Actions in the .desktop file): they only OPEN a view; nothing is run."""
         if view not in VIEWS: return
         if self.props.active_window is None: self.start_view = view; self.activate(); return
-        w = self.props.active_window; hypr_window("bring_back"); w.present()
+        w = self.props.active_window; hypr_window("bring_back"); w.present(); self.check_restart()
         w.show_view("installed" if view == "installed" else "updates", focus_all=view == "update-all")
         if view in ("updates", "update-all"): w.check_updates(asked=view == "updates")
 
@@ -1350,12 +1394,13 @@ def self_test():
     ALLOWED_PREFIXED = {"shutil.which", "tempfile.mkstemp"}
     DUNDERS = ("__dict__", "__getattribute__", "__class__", "__subclasses__", "__globals__", "__builtins__", "__code__", "__doc__")
     forbidden_hits = sorted({f for f, _ in refs if f in FORBIDDEN or (f.startswith(FORBIDDEN_PREFIXES) and f not in ALLOWED_PREFIXED) or f.endswith(DUNDERS)})
+    iv_ids = {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "installed_version" for n in ast.walk(fn)}   # 1.1.12: own VERSION line
     # open() only as the audited `open(path, "rb")` read of the catalog cache — two positional arguments, no keywords
     # 1.1.4: plus exactly two read-only opens of the pacman database, inside installed_packages / repo_versions
     db_ids = {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name in ("installed_packages", "repo_versions") for n in ast.walk(fn)}
     DB_OPENS = {"open(os.path.join(local, d, 'desc'), 'rb')", "open(os.path.join(sync, f), 'rb')"}
     bad_open = [ast.unparse(n)[:50] for f, n in calls if f == "open" and not (len(n.args) == 2 and ast.unparse(n.args[0]) == "self.path" and getattr(n.args[1], "value", "") == "rb" and not n.keywords)
-                and not (id(n) in db_ids and ast.unparse(n) in DB_OPENS)]
+                and not (id(n) in db_ids and ast.unparse(n) in DB_OPENS) and not (id(n) in iv_ids and ast.unparse(n) == "open(path, 'rb')")]
     tar_refs = [(f, n) for f, n in refs if f.split(".")[0] in ("tarfile", "gzip", "io") or f.endswith((".extract", ".extractall"))]
     tar_ok = all(id(n) in db_ids for _, n in tar_refs) and not any(f.endswith((".extract", ".extractall")) for f, _ in tar_refs) \
         and sorted({f for f, _ in tar_refs}) == ["gzip", "gzip.decompress", "io", "io.BytesIO", "tarfile", "tarfile.TarError", "tarfile.open"]
@@ -1375,6 +1420,16 @@ def self_test():
     POPEN = "subprocess.Popen([*term, bash, '-c', terminal_script(argv, title, checked)], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)"
     oit = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "open_in_terminal")
     popen_refs = [f for f, _ in refs if f.endswith("Popen")]
+    # 1.1.12: the third Popen is relaunch(): the same interpreter, -I, this very file, nothing from the page; called only from
+    # run_app after the user pressed Restart and the instance shut down
+    RL_POPEN = "subprocess.Popen([sys.executable, '-I', SELF_FILE], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+    rlf = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "relaunch")
+    rl_calls = [n for f, n in calls if f == "relaunch"]
+    raf = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "run_app")
+    rrf = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "restart_running")
+    rl_ok = (len(rl_calls) == 2 and sum(1 for n in rl_calls if n in list(ast.walk(raf))) == 1 and sum(1 for n in rl_calls if n in list(ast.walk(rrf))) == 1
+             and "if app.restart:" in ast.unparse(raf) and "if not own:" in ast.unparse(rrf)
+             and SELF_FILE == os.path.abspath(__file__) and restart_pending(os.devnull) == "")
     net_opens = [n for f, n in calls if f == "opener.open"]; net_reqs = [n for f, n in calls if f == "urllib.request.Request"]
     refresh_ids = {id(n) for fn in nodes if isinstance(fn, ast.FunctionDef) and fn.name == "_refresh" for n in ast.walk(fn)}
     net_refs = [(f, n) for f, n in refs if f in ("urllib.request.build_opener", "urllib.request.Request", "opener.open", "opener")]
@@ -1517,10 +1572,12 @@ def self_test():
         (len(selftests) == 1 and all(id(n) in main_ids for f, n in refs if f == "self_test"), "exactly one self_test, called only from the __main__ block"),
         (not forbidden_hits, f"no eval/exec/getattr/import tricks, os.system/exec/spawn/fork/setuid, Gio.Subprocess/AppInfo, GLib.spawn, socket/ctypes/pty, raw os writes, shutil/tempfile beyond which/mkstemp, urlopen/urlretrieve {forbidden_hits}"),
         (not bad_open, f"open() only as the two-argument 'rb' read of the catalog cache {bad_open}"),
-        (len(popen_sites) == 2 and len(popen_refs) == 2
+        (len(popen_sites) == 3 and len(popen_refs) == 3
          and sum(1 for n in popen_sites if n in list(ast.walk(oit)) and ast.unparse(n) == POPEN) == 1
-         and sum(1 for n in popen_sites if n in list(ast.walk(rof)) and ast.unparse(n) == RO_POPEN) == 1,
-         "exactly two subprocess.Popen: the terminal one inside open_in_terminal and the read-only query inside read_only, each with exactly the audited arguments (no shell=, no env=, no preexec_fn=)"),
+         and sum(1 for n in popen_sites if n in list(ast.walk(rof)) and ast.unparse(n) == RO_POPEN) == 1
+         and sum(1 for n in popen_sites if n in list(ast.walk(rlf)) and ast.unparse(n) == RL_POPEN) == 1,
+         "exactly three subprocess.Popen: the terminal one inside open_in_terminal, the read-only query inside read_only and the Restart relaunch of this same file, each with exactly the audited arguments (no shell=, no env=, no preexec_fn=)"),
+        (rl_ok, "Restart starts only this app file again: from run_app after the user pressed Restart, or from --restart once the running instance has quit by itself; an unreadable file never offers a restart"),
         (ro_ok, "read-only update queries are only checkupdates --nocolor, yay -Qua, paru -Qua (fixed argv), and their output is parsed against the package-name pattern"),
         (net_pinned and len(net_opens) == 1 and getattr(net_opens[0].args[0], "id", "") == "req" and len(net_reqs) == 1 and getattr(net_reqs[0].args[0], "id", "") == "url"
          and fetch_loop_ok and CATALOG_URL.endswith("/catalog.json") and PLUGINS_URL == CATALOG_URL[:-len("catalog.json")] + "plugins.json",
@@ -1618,14 +1675,40 @@ def probe(url):
     app.connect("activate", on_activate); app.run([]); return 0 if res["terminal"] else 1
 
 
+def restart_running():
+    """--restart (the command install.sh offers after an update): ask the running instance to quit through its own quit action
+    (every version has it), wait up to 10 s until it has let go, then start the updated file once. Nothing is killed."""
+    app = App(fetch=False); app.register(None)
+    if not app.get_is_remote(): print("Omarchy Store is not running. Open it from your app launcher."); return 0
+    app.activate_action("quit", None)
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    for _ in range(50):
+        GLib.usleep(200000)
+        own = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner",
+                            GLib.Variant("(s)", (APP_ID,)), GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+        if not own:
+            relaunch(); print("Omarchy Store restarted."); return 0
+    print("Omarchy Store did not close (it may be asking something). Close it with Ctrl+Q and open it again."); return 1
+
+
+def run_app(app):
+    """Run the app; if the user pressed Restart, start the updated file once after this instance has shut down."""
+    rc = app.run([sys.argv[0]])
+    if app.restart:
+        app.run_dispose(); del app                                          # release the single-instance name first
+        relaunch()
+    return rc
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args[:1] == ["--self-test"]: sys.exit(self_test())
+    if args == ["--restart"]: sys.exit(restart_running())
     if args[:1] == ["--probe"] and len(args) == 2: sys.exit(probe(args[1]))
     if args[:1] == ["--snapshot"] and len(args) == 2: sys.exit(snapshot(args[1], HOME_URL))
     if len(args) == 1 and args[0][2:] in VIEWS and args[0][:2] == "--":     # dock menu: open a view in the running app, or start with it
         app = App(); app.register(None)
         if app.get_is_remote(): app.activate_action("show-view", GLib.Variant("s", args[0][2:])); sys.exit(0)
-        app.start_view = args[0][2:]; sys.exit(app.run([sys.argv[0]]))
-    if args: print(f"omarchy-store-desktop {VERSION}\nusage: omarchy-store-desktop [--updates | --update-all | --installed | --self-test | --probe <store app url> | --snapshot out.png]"); sys.exit(2)
-    sys.exit(App().run([sys.argv[0]]))
+        app.start_view = args[0][2:]; sys.exit(run_app(app))
+    if args: print(f"omarchy-store-desktop {VERSION}\nusage: omarchy-store-desktop [--updates | --update-all | --installed | --restart | --self-test | --probe <store app url> | --snapshot out.png]"); sys.exit(2)
+    sys.exit(run_app(App()))

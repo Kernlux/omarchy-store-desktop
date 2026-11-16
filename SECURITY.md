@@ -109,6 +109,11 @@ accident. Residual, accepted: Enter pressed in a store search box arms one actio
 its own, in a loop, or at load time (the review's attack page: 3 terminals + 5 browser windows in 1.1.0, nothing in
 1.1.1). The page never supplies a command, package name or flag.
 
+**Restart after an update (1.1.12).** The app reads the VERSION line of its own file (read-only, 64 KiB); when the file is
+newer than the running code it shows one Restart button, which quits the app and starts the same file once (fixed argv).
+`--restart` asks a running instance to quit through its own quit action, then starts it again; install.sh only looks
+(pgrep) and prints that command. Nothing is killed. See SECURITY-REVIEW-1.1.12.md.
+
 **No partial upgrades (1.1.11).** A store app from the Arch / Omarchy repositories is never updated on its own: its button
 runs the full Omarchy & system update (`omarchy update`) after a line saying why. `yay -S` only ever gets AUR packages.
 No command contains `-Sy`. See SECURITY-REVIEW-1.1.11.md.
@@ -189,9 +194,9 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (110 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (111 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (250 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (257 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.

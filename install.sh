@@ -88,12 +88,22 @@ for s in "${icon_sizes[@]}"; do
 done
 refresh_caches
 
+# 1.1.12: an open Omarchy Store keeps running the OLD version (opening it again only brings that window back). Only LOOK for
+# it (pgrep, read-only); never stop it from here: print the one command that asks it to restart itself.
+running=""
+command -v pgrep >/dev/null 2>&1 && pgrep -u "$(id -u)" -f 'omarchy-store-desktop\.py' >/dev/null 2>&1 && running=1
+restart_hint() {
+  if [[ -n "$running" ]]; then
+    echo "Omarchy Store is still open and running the old version. Restart it now with:  $launcher --restart"
+    echo "(or close it with Ctrl+Q and open it again)"
+  fi
+}
 if [[ -n "$old_ver" && "$old_ver" == "$new_ver" ]]; then
   echo "Reinstalled $new_ver."
-  echo "If Omarchy Store is open, close it (menu > Quit, or Ctrl+Q) and open it again."
+  restart_hint
 elif [[ -n "$old_ver" ]]; then
   echo "Updated $old_ver -> $new_ver."
-  echo "If Omarchy Store is open, close it (menu > Quit, or Ctrl+Q) and open it again to use the new version."
+  restart_hint
 else
   echo "Installed. Launch 'Omarchy Store' from your app launcher, or run: omarchy-store-desktop"
 fi
