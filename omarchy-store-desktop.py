@@ -36,7 +36,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.12"
+VERSION = "1.1.13"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -734,7 +734,7 @@ class Window(Adw.ApplicationWindow):
         ns = WebKit.NetworkSession.new(os.path.join(CONF, "web"), os.path.join(CACHE, "web"))   # (data dir, cache dir)
         ns.set_tls_errors_policy(WebKit.TLSErrorsPolicy.FAIL)            # a bad certificate is an error, never a prompt
         ns.set_persistent_credential_storage_enabled(False)              # never store HTTP auth credentials
-        ns.connect("download-started", lambda _s, d: (d.cancel(), self.note("This app never saves files. Open the link in your browser instead.")))   # hard stop, said out loud
+        ns.connect("download-started", self.on_download)                 # never saved here: cancelled, handed to the browser on a real click
         cm = ns.get_cookie_manager()
         cm.set_persistent_storage(os.path.join(CONF, "cookies.sqlite"), WebKit.CookiePersistentStorage.SQLITE)
         cm.set_accept_policy(WebKit.CookieAcceptPolicy.NO_THIRD_PARTY)
@@ -892,6 +892,17 @@ class Window(Adw.ApplicationWindow):
         if is_store_url(uri): self.web.load_uri(uri)
         elif link_click(nav) and self.take_input(): self.open_external(uri)
         return None
+
+    def on_download(self, _session, dl):
+        """1.1.13 (Luca, 16 Nov: Download on a store page gave "This app never saves files"). The app still never saves a file:
+        the download is cancelled at once. If the user really clicked (the same 3-second input gate as installs), the file's
+        https address goes to their browser, which downloads it the normal way; anything else (a script, a redirect) is dropped."""
+        req = dl.get_request(); uri = req.get_uri() if req else ""
+        dl.cancel()
+        if isinstance(uri, str) and uri.startswith("https://") and self.take_input() and self.open_external(uri):
+            self.note("Opened in your browser: it downloads the file there.")
+        else:
+            self.note("This app never saves files. Open the link in your browser instead.")
 
     def open_external(self, uri):
         """Hand a link to the system browser / mail client. https, http and mailto only — never file:,
@@ -1066,7 +1077,7 @@ class Window(Adw.ApplicationWindow):
     def info(self):
         """Read-only snapshot for the store's Updates / Installed pages: bounded, plain values only."""
         u = self.upd; apps = self.upd_apps(); st = u["store"]
-        return {"v": 1, "version": VERSION, "installed": installed_version() or VERSION, "busy": bool(u["busy"]), "when": u["when"], "total": self.upd_total(),
+        return {"v": 1, "version": VERSION, "installed_version": installed_version() or VERSION, "busy": bool(u["busy"]), "when": u["when"], "total": self.upd_total(),
                 "store": {"latest": st[0]} if st else None,
                 "apps": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]),
                           "from": nw[next(p for p in pk if p in nw)][0], "to": nw[next(p for p in pk if p in nw)][1],
@@ -1499,6 +1510,9 @@ def self_test():
                     and parse_message('{"t":"addon","kind":"theme","id":"gruvbox"}') == ("addon", ("theme", "gruvbox"))
                     and parse_message('{"t":"addon","kind":"app","id":"x"}') is None and parse_message('{"t":"addon","kind":["plugin"],"id":"x"}') is None
                     and parse_message('{"t":"addon","kind":"plugin","id":"a;b"}') is None and parse_message('{"t":"addon","kind":"plugin","id":"x","cmd":"id"}') == ("addon", ("plugin", "x")))
+    dlf = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "on_download"))
+    dl_ok = (dlf.index("dl.cancel()") < dlf.index("open_external") and "uri.startswith('https://') and self.take_input() and self.open_external(uri)" in dlf
+             and not any(isinstance(n, ast.Attribute) and n.attr in ("set_destination", "set_allow_overwrite") for n in ast.walk(tree)) and "ns.connect('download-started', self.on_download)" in ast.unparse(tree))
     rc = update_chain((("system", "repo"),)); rp = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "page_update"))
     try: update_chain((("system", "x"),)); bad_variant = False
     except ValueError: bad_variant = True
@@ -1611,6 +1625,7 @@ def self_test():
         (chk_refuse, "a missing, red, stale, future, malformed or unknown-named check is refused (no terminal)"),
         (chk_gate_ok, "on_message refuses every install / add-on / update before anything else unless message_check found a valid check, and passes that line to the terminal"),
         (chk_printed, "the terminal prints the safety-check line before it asks for Enter"),
+        (dl_ok, "a download is always cancelled first; only an https address after a real click goes to the browser; the app never writes a downloaded file"),
         (repo_chain_ok, "a repository app's update runs the full system update with the reason shown first; yay -S never gets a repository package; never -Sy"),
         (ext_ok, "only a user-clicked LINK (not a redirect, not a frame loading, not a script, not aimed at a named frame) may open the browser"),
         (ext_wired, "both outside-navigation paths (on_policy, on_create) use link_click() and nothing else opens the browser from a navigation"),

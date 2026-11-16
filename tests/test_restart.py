@@ -55,3 +55,13 @@ def test_installer_only_looks_and_prints():
     src = open(os.path.join(HERE, "install.sh")).read()
     assert "pgrep -u" in src and "--restart" in src
     assert not re.search(r"\b(pkill|killall|kill)\b", src.replace("pgrep", ""))
+
+
+def test_info_carries_the_installed_file_version_without_clobbering_the_app_list():
+    # 1.1.12 shipped with the key "installed", which the installed-apps list right below it overwrote in the same dict
+    # literal, so the page never saw the file's version; 1.1.13 uses its own key.
+    class W:
+        upd = {"pending": [], "aur": [], "store": None, "have": {}, "busy": False, "when": "", "source": "checked"}
+        upd_apps = lambda s: []; upd_total = lambda s: 0; store_apps = lambda s: []; repo_names = lambda s: set()
+    info = m.Window.info(W())
+    assert info["installed_version"] == m.VERSION and isinstance(info["installed"], list)
