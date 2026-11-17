@@ -14,7 +14,7 @@ depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'webkitgtk-6.0' 'xdg-term
 optdepends=('flatpak: for Flatpak listings')
 # Public source: https://codeberg.org/kernlux/omarchy-store-desktop (GitHub is only a mirror). The release asset is pinned by sha256.
 source=("$pkgname-$pkgver.tar.gz::https://codeberg.org/kernlux/omarchy-store-desktop/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-sha256sums=('e13040c7fd973dc1cb7d976fe6d986af32d6e3c581e8887929a13cabfdef04d1')
+sha256sums=('10da66176ac6516b30ea42bb0db8d0759f0962474a0970a1d64e9da16a1378a0')
 
 check() {
   cd "$pkgname-$pkgver"
