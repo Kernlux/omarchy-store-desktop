@@ -62,6 +62,6 @@ def test_info_carries_the_installed_file_version_without_clobbering_the_app_list
     # literal, so the page never saw the file's version; 1.1.13 uses its own key.
     class W:
         upd = {"pending": [], "aur": [], "store": None, "have": {}, "busy": False, "when": "", "source": "checked"}
-        upd_apps = lambda s: []; upd_total = lambda s: 0; store_apps = lambda s: []; repo_names = lambda s: set()
+        upd_apps = lambda s: []; upd_total = lambda s: 0; store_apps = lambda s: []; repo_names = lambda s: set(); upd_coming = lambda s: []
     info = m.Window.info(W())
     assert info["installed_version"] == m.VERSION and isinstance(info["installed"], list)

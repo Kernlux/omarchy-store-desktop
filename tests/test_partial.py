@@ -21,6 +21,7 @@ class Win:
     upd_apps = m.Window.upd_apps
     repo_names = m.Window.repo_names
     upd_total = m.Window.upd_total
+    upd_coming = m.Window.upd_coming
     page_update = m.Window.page_update
 
     def __init__(self):

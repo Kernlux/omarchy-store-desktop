@@ -109,6 +109,10 @@ accident. Residual, accepted: Enter pressed in a store search box arms one actio
 its own, in a loop, or at load time (the review's attack page: 3 terminals + 5 browser windows in 1.1.0, nothing in
 1.1.1). The page never supplies a command, package name or flag.
 
+**Coming updates (1.1.15).** A newer version that is out upstream (the catalog the app already downloads) but not on your
+mirror yet is shown with its version arrow and a plain reason, never with a button: no mirror switch, no partial upgrade, no
+new network contact, no background notifier. See SECURITY-REVIEW-1.1.15.md.
+
 **Pin to dock (1.1.14).** Only when you pick "Pin to dock…": the app adds its launcher id to that one dock's own pin list
 (SnapDock, Omarchy dock, nwg-dock-hyprland), atomically, after a backup next to it, and Unpin removes it again. It never
 touches the compositor config, never runs as root, never watches anything. See SECURITY-REVIEW-1.1.14.md.
@@ -201,9 +205,9 @@ and makepkg 6.0.2 on Ubuntu (identical file lists); `pacman -Qi` reports `Instal
 nothing behind.
 
 ## Verify it yourself
-`python3 -I omarchy-store-desktop.py --self-test` (113 checks, no display, no network: the command allow-list,
+`python3 -I omarchy-store-desktop.py --self-test` (114 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (281 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (289 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.

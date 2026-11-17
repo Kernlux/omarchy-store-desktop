@@ -38,7 +38,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.14"
+VERSION = "1.1.15"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -401,6 +401,30 @@ def check_pending(root=PACMAN_DB):
         if rr is not None:
             aur = [u for u in parse_upgrades(rr[1]) if u[0] in have]; break
     return have, pend, aur, src
+
+
+# 1.1.15 (Luca, 17 Nov: "what good is an update if you can't be notified of them"): Omarchy's stable mirror gets new Arch
+# versions later than Arch itself (Telegram 7.4.4 was out; his mirror still had 7.3.2, so checkupdates listed nothing). The
+# catalog (already fetched from the store) carries each app's current upstream version, refreshed nightly; an installed
+# repository app whose upstream version is newer than what the user has, and which the fresh mirror list does NOT offer,
+# is shown as "coming": with its version arrow and a plain reason, never with a button (no mirror switch, no partial
+# upgrade, nothing to run). No new network contact: the catalog is the copy the app already reads.
+UPSTREAM_RE = re.compile(r"(?:[0-9]{1,6}:)?[0-9A-Za-z][0-9A-Za-z.+_~]{0,63}-[0-9][0-9.]{0,9}")
+COMING_WHY = "Omarchy's stable mirror gets it later; the Omarchy & system update will install it when it arrives."
+
+
+def coming_updates(apps, have, pending):
+    """[(entry, package, installed, upstream)] for store apps from the repositories (pacman / omarchy listings) whose
+    catalog upstream version is newer than the installed one while the mirror's fresh list (pending) does not offer it."""
+    ready, out = {n for n, _v, _w in pending}, []
+    for a, pk, m in apps:
+        if m not in ("pacman", "omarchy") or not pk: continue
+        pkg, p = a.get("package"), pk[0]
+        up = pkg.get("version") if isinstance(pkg, dict) and pkg.get("name") == p else None
+        if not isinstance(up, str) or not UPSTREAM_RE.fullmatch(up) or p in ready or p not in have: continue
+        if pkg.get("repo") == "aur": continue
+        if vercmp(up, have[p]) > 0: out.append((a, p, have[p], up))
+    return out
 
 
 CHAIN_NOTE = {"store": "Omarchy Store is updated: close it and open it again when this finishes.", "system": "Restart if it asks.",
@@ -1385,7 +1409,10 @@ class Window(Adw.ApplicationWindow):
                             store=app_update(self.catalog.latest), busy=False,
                             when=GLib.DateTime.new_now_local().format("%H:%M"))
             self.render_updates(); self.render_installed()
-            if asked: self.note(f"{self.upd_total()} update(s) found." if self.upd_total() else "Everything is up to date.")
+            if asked:
+                c = len(self.upd_coming())
+                self.note((f"{self.upd_total()} update(s) ready." if self.upd_total() else "Nothing to install right now.") +
+                          (f" {c} more out, coming with a later Omarchy update." if c else ("" if self.upd_total() else " Everything is up to date.")))
             return False
         GLib.timeout_add(500, finish)
 
@@ -1409,6 +1436,12 @@ class Window(Adw.ApplicationWindow):
     def upd_total(self):
         return len(self.upd["pending"]) + len(self.upd["aur"]) + (1 if self.upd["store"] else 0)
 
+    def upd_coming(self):
+        """1.1.15: newer versions out upstream that the user's mirror does not offer yet (shown, never installable here)."""
+        u = self.upd
+        if u["busy"] or not u["have"] or u["source"] not in ("checked", "local"): return []
+        return coming_updates(self.store_apps(), u["have"], u["pending"])
+
     def info(self):
         """Read-only snapshot for the store's Updates / Installed pages: bounded, plain values only."""
         u = self.upd; apps = self.upd_apps(); st = u["store"]
@@ -1420,6 +1453,9 @@ class Window(Adw.ApplicationWindow):
                           "pkgs": [p for p in pk if p in nw][:20], "repo": any(p in self.repo_names() for p in pk if p in nw)} for a, pk, nw in apps][:200],
                 "system": {"count": len(u["pending"]), "list": [[n, v, w] for n, v, w in u["pending"]][:60]},
                 "aur": {"count": len(u["aur"]), "list": [[n, v, w] for n, v, w in u["aur"]][:60]},
+                # 1.1.15: out upstream, not on the user's mirror yet: shown with a reason, no button, never counted in "total"
+                "coming": {"count": len(cm := self.upd_coming()), "why": COMING_WHY,
+                           "list": [{"id": a["id"], "name": safe_title(a.get("name") or a["id"], a["id"]), "pkg": p, "from": v, "to": w} for a, p, v, w in cm][:200]},
                 "source": u["source"],     # "checked" = fresh lists (checkupdates); "local" = only as new as the last pacman -Sy
                 "omarchy": {"version": u["have"].get("omarchy") or u["have"].get("omarchy-dev") or "",
                             "update": next(([v, w] for n, v, w in u["pending"] if n in ("omarchy", "omarchy-dev")), None)},
@@ -1495,7 +1531,8 @@ class Window(Adw.ApplicationWindow):
         for key, n in (("updates", total), ("installed", len(self.store_apps()))):
             bl = self.nav_badges.get(key)
             if bl: bl.set_label(str(n)); bl.set_visible(n > 0); bl.set_css_classes(["os-badge"] if key == "updates" else ["os-badge", "muted"])
-        self.upd_btn.set_label(f"Updates  {total}"); self.upd_btn.set_visible(total > 0)
+        coming = self.upd_coming()
+        self.upd_btn.set_label(f"Updates  {total}" + (f" + {len(coming)} coming" if coming else "")); self.upd_btn.set_visible(total > 0 or bool(coming))
         head = Gtk.Box(spacing=12); tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
         tb.append(Gtk.Label(label="Updates", xalign=0, css_classes=["title-1"]))
         tb.append(Gtk.Label(label="Checking…" if u["busy"] else (f"Checked at {u['when']}" if u["when"] else "Not checked yet"), xalign=0, css_classes=["dim-label"]))
@@ -1528,6 +1565,9 @@ class Window(Adw.ApplicationWindow):
         for n, v, w in [x for x in pend if x[0] != "omarchy"][:8]: g2.append(self._row(n, f"{v}  →  {w}"))
         if len(pend) > 9: g2.append(Gtk.Label(label=f"+{len(pend) - 9 if om else len(pend) - 8} more", xalign=0, css_classes=["dim-label"]))
         if not pend: g2.append(Gtk.Label(label="No newer packages in your last package list. The button still runs Omarchy's own update check.", xalign=0, wrap=True))
+        if coming:
+            g3 = self._group(box, "New version out, not on your mirror yet", len(coming), COMING_WHY)
+            for a, p, v, w in coming: g3.append(self._row(safe_title(a.get("name") or a["id"], a["id"]), f"{v}  →  {w}"))
 
     def render_installed(self):
         box = self.inst_box; self._clear(box); items = self.store_apps()
@@ -1859,6 +1899,13 @@ def self_test():
     dlf = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "on_download"))
     dl_ok = (dlf.index("dl.cancel()") < dlf.index("open_external") and "uri.startswith('https://') and self.take_input() and self.open_external(uri)" in dlf
              and not any(isinstance(n, ast.Attribute) and n.attr in ("set_destination", "set_allow_overwrite") for n in ast.walk(tree)) and "ns.connect('download-started', self.on_download)" in ast.unparse(tree))
+    _ca = [({"id": "telegram", "package": {"name": "telegram-desktop", "repo": "extra", "version": "7.4.4-1"}}, ("telegram-desktop",), "pacman"),
+           ({"id": "x", "package": {"name": "x", "repo": "aur", "version": "9-1"}}, ("x",), "aur"),
+           ({"id": "bad", "package": {"name": "bad", "repo": "extra", "version": "1; rm -rf ~"}}, ("bad",), "pacman"),
+           ({"id": "btop", "package": {"name": "btop", "repo": "extra", "version": "1.5-1"}}, ("btop",), "pacman")]
+    _cr = coming_updates(_ca, {"telegram-desktop": "7.3.2-1", "x": "1-1", "bad": "0-1", "btop": "1.4-1"}, [("btop", "1.4-1", "1.5-1")])
+    coming_ok = [(a["id"], p, v, w) for a, p, v, w in _cr] == [("telegram", "telegram-desktop", "7.3.2-1", "7.4.4-1")] and \
+        coming_updates(_ca[:1], {"telegram-desktop": "7.4.4-1"}, []) == [] and "Button" not in ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "coming_updates"))
     rc = update_chain((("system", "repo"),)); rp = ast.unparse(next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "page_update"))
     try: update_chain((("system", "x"),)); bad_variant = False
     except ValueError: bad_variant = True
@@ -1995,6 +2042,7 @@ def self_test():
         (chk_refuse, "a missing, red, stale, future, malformed or unknown-named check is refused (no terminal)"),
         (chk_gate_ok, "on_message refuses every install / add-on / update before anything else unless message_check found a valid check, and passes that line to the terminal"),
         (chk_printed, "the terminal prints the safety-check line before it asks for Enter"),
+        (coming_ok, "a newer upstream version the mirror does not offer is shown as coming (version arrow, no button), never for AUR, never when the mirror lists it, never from a malformed version"),
         (dl_ok, "a download is always cancelled first; only an https address after a real click goes to the browser; the app never writes a downloaded file"),
         (repo_chain_ok, "a repository app's update runs the full system update with the reason shown first; yay -S never gets a repository package; never -Sy"),
         (ext_ok, "only a user-clicked LINK (not a redirect, not a frame loading, not a script, not aimed at a named frame) may open the browser"),
