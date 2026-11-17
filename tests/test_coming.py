@@ -75,3 +75,23 @@ def test_malformed_catalog_version_is_ignored():
 def test_epoch_versions_compare_with_pacman_rules():
     a = dict(TG, package={"name": "telegram-desktop", "repo": "extra", "version": "1:7.0-1"})
     assert len(m.coming_updates([(a, ("telegram-desktop",), "pacman")], HAVE, [])) == 1
+
+
+FF = {"id": "firefox", "name": "Firefox", "install": {"method": "omarchy", "command": "omarchy install browser firefox"},
+      "package": {"name": "firefox", "repo": "extra", "version": "160.0-1"}}
+
+
+def test_omarchy_install_listings_without_a_package_list_are_tracked_too():
+    # 1.1.16: Firefox / Brave / Chrome / 1Password are listed as `omarchy install …` (no package list) and were never in Updates
+    w = FakeWin(dict(HAVE, firefox="158.0.1-1"), pending=[]); w.catalog = m.Catalog.from_apps([TG, YT, OWE, FF])
+    assert "firefox" in [c["id"] for c in w.info()["coming"]["list"]]
+    w = FakeWin(dict(HAVE, firefox="158.0.1-1"), pending=[("firefox", "158.0.1-1", "160.0-1")]); w.catalog = m.Catalog.from_apps([TG, YT, OWE, FF])
+    i = w.info()
+    assert "firefox" in [a["id"] for a in i["apps"]] and next(a for a in i["apps"] if a["id"] == "firefox")["repo"] is True
+    assert "firefox" in [a["id"] for a in i["installed"]]
+
+
+def test_a_bad_package_name_in_such_a_listing_is_ignored():
+    bad = dict(FF, id="bad", package={"name": "-rf", "repo": "extra", "version": "9-1"})
+    w = FakeWin(dict(HAVE, **{"-rf": "1-1"}), pending=[]); w.catalog = m.Catalog.from_apps([bad])
+    assert w.store_apps() == []

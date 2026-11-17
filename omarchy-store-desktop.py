@@ -38,7 +38,7 @@ gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_ver
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.15"
+VERSION = "1.1.16"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -1417,12 +1417,17 @@ class Window(Adw.ApplicationWindow):
         GLib.timeout_add(500, finish)
 
     def store_apps(self):
-        """[(entry, packages, method)] for catalog apps whose packages are all installed (pacman/omarchy/AUR listings)."""
+        """[(entry, packages, method)] for catalog apps whose packages are all installed (pacman/omarchy/AUR listings).
+        1.1.16: also the `omarchy install …` listings (Firefox, Brave, Chrome, 1Password …), which have no package list: their
+        package record's name, if it is a valid package name. Only for showing updates; installs still need command_for."""
         have, out = self.upd["have"], []
         for a in list(self.catalog.apps.values()):
             inst = a.get("install") if isinstance(a.get("install"), dict) else {}
             pk, m = inst.get("packages"), inst.get("method")
             if m in ("pacman", "omarchy", "aur") and self.catalog.command_for(a) and all(p in have for p in pk): out.append((a, tuple(pk), m))
+            elif m == "omarchy" and pk is None:
+                n = a.get("package").get("name") if isinstance(a.get("package"), dict) else None
+                if isinstance(n, str) and PKG_RE.fullmatch(n) and n in have: out.append((a, (n,), m))
         return sorted(out, key=lambda x: safe_title(x[0].get("name") or x[0]["id"], x[0]["id"]).lower())
 
     def upd_apps(self):
