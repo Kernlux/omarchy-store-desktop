@@ -51,7 +51,7 @@ with a copy-the-launcher-id fallback; a backup and Unpin; never the Hyprland con
 - Self-test: 113 checks pass. New audit: writes only through `dock_write` (called only from `dock_change` and the tip
   marker); `fcntl` only in `dock_change`; four audited opens (cmdline, Omarchy defaults, the pin list, the lock for flock);
   no adapter path near `.config/hypr`; every adapter round-trips its own format; Legal Desk named, never written.
-- pytest tests/: 281 (280 passed, 1 skipped). New `tests/test_docks.py` (20): exact diffs for each dock, backup content,
+- pytest tests/: 281 tests (280 passed, 1 skipped). New `tests/test_docks.py` (20): exact diffs for each dock, backup content,
   0600 kept, no temp files left, unpin restores the original bytes, Omarchy defaults rule (user file with and without own
   pins), SnapDock never creates its settings, refusals: symlinked pin list, folder link out of home, XDG path outside home,
   SnapDock lock held, changed a moment ago, changed while we worked, garbage JSON; fake /proc detection; Legal Desk.
