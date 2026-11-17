@@ -21,7 +21,9 @@ SECURITY MODEL — read this before changing anything:
   * WebKit may never save a file (every download is cancelled; after a click the URL goes to the browser) and may
     never show a password, prompt() or file-chooser dialog inside this window.
   * It writes only under $XDG_CONFIG_HOME/omarchy-store and $XDG_CACHE_HOME/omarchy-store (0700), plus the
-    toolkit's own caches under $XDG_CACHE_HOME (GTK, WebKit, Mesa).
+    toolkit's own caches under $XDG_CACHE_HOME (GTK, WebKit, Mesa). 1.1.14: when the USER picks "Pin to dock…", it also
+    rewrites that one dock's own pin list (DOCKS: SnapDock, Omarchy dock, nwg-dock-hyprland), atomically, with a backup
+    next to it. Never the compositor config, never root, never a watcher.
   * Window control on Hyprland (1.1.4): Hyprland ignores a client's own maximize request and a dock may park a window on a
     hidden "special" workspace. hypr_window() talks to the user's OWN compositor over its local socket, and only about
     THIS process's window: it reads the client list, picks the window whose pid is ours, and sends one of two fixed
@@ -30,13 +32,13 @@ SECURITY MODEL — read this before changing anything:
   * `--self-test` proves the allow-list, the validation and the static audit of this file without a display and is
     run by the PKGBUILD's check(); tests/ cover the packaging and the no-hook facts.
 """
-import gzip, io, json, os, re, shlex, shutil, socket, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request
+import fcntl, gzip, io, json, os, re, shlex, shutil, socket, stat, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request
 import gi
 gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); gi.require_version("WebKit", "6.0")
 from gi.repository import Gtk, Adw, WebKit, GLib, Gio, Gdk
 
 APP_ID = "com.omarchystore.Store"
-VERSION = "1.1.13"
+VERSION = "1.1.14"
 STORE_HOSTS = ("omarchystore.com", "www.omarchystore.com")
 # The store's API worker may load inside the window (it is part of the store) but it is never "the store": no bridge,
 # no catalog and no home page may come from it — and it may only be the main frame, never a subframe (the message handler
@@ -723,6 +725,230 @@ def hypr_window(action):
     return False
 
 
+# --- Pin to dock (1.1.14) ---
+# Only when the user asks (menu "Pin to dock…", then a confirm or a picker). Each dock is ONE small adapter in DOCKS: how
+# to recognise it running (its process), where its own pin list lives under the user's home, which id it uses for this
+# app, and two pure functions that read and rewrite that list. Adding a dock = adding one entry (see SECURITY-REVIEW-1.1.14).
+# Rules: only that dock's pin-list entry changes; a backup of the file is written next to it first; "Unpin" removes the
+# entry again; never root, never a watcher, never a hook, never the compositor config (~/.config/hypr is never touched:
+# no adapter may point there, checked by --self-test). Symlinked or foreign-owned pin lists, files outside the home
+# folder, a dock holding its own lock or a file that changed in the last second are refused, never guessed at.
+DOCK_PROC = "/proc"                    # read-only: which docks run (the user's own processes only)
+DOCK_OMARCHY = "/usr/share/omarchy"    # read-only: Omarchy's default dock pins, when the user has none of their own
+DOCK_MAX = 1 << 20                     # a pin list larger than 1 MB is not a pin list
+DOCK_BAK = ".omarchy-store.bak"        # backup written next to the pin list before every change
+
+
+def _json_obj(text):
+    d = json.loads(text) if text.strip() else {}
+    if not isinstance(d, dict): raise ValueError("not a JSON object")
+    return d
+
+
+def _snap_get(text, _base=""):
+    pins = _json_obj(text).get("pins", [])
+    if not isinstance(pins, list) or not all(isinstance(p, str) for p in pins): raise ValueError("pins is not a list of names")
+    return pins
+
+
+def _snap_put(text, pins, _base=""):
+    d = _json_obj(text); d["pins"] = list(pins)
+    return json.dumps(d, indent=2) + "\n"                               # the exact layout SnapDock's own sd-settings writes
+
+
+def _oma_get(text, base=""):
+    # a shell.json without pins of its own uses Omarchy's default pins (the same rule as `omarchy-dock pin`)
+    src = _json_obj(text) if text.strip() else {}
+    pins = src["dock"].get("pinned") if isinstance(src.get("dock"), dict) else None
+    if pins is None and base.strip():
+        b = _json_obj(base)
+        pins = b["dock"].get("pinned") if isinstance(b.get("dock"), dict) else None
+    pins = [] if pins is None else pins
+    if not isinstance(pins, list) or not all(isinstance(p, str) for p in pins): raise ValueError("dock.pinned is not a list of names")
+    return pins
+
+
+def _oma_put(text, pins, base=""):
+    d = _json_obj(text if text.strip() else base)                       # no user file yet: start from Omarchy's defaults, like omarchy-dock
+    if not isinstance(d.get("dock"), dict): d["dock"] = {}
+    d["dock"]["pinned"] = list(pins)
+    return json.dumps(d, indent=2, ensure_ascii=False, sort_keys=True) + "\n"   # `jq -S` layout, as omarchy-dock writes it
+
+
+def _nwg_get(text, _base=""):
+    return [ln.strip() for ln in text.split("\n") if ln.strip()]
+
+
+def _nwg_put(text, pins, _base=""):
+    return "".join(p + "\n" for p in pins)                              # one id per line, as nwg-dock-hyprland's savePinned writes
+
+
+# key, name, how it runs (an argv element or the program name), (XDG variable, default under home, file), its own lock
+# file (same folder) or "", the id it stores for this app, read, rewrite, Omarchy-defaults seed, may the file be created
+DOCKS = (
+    {"key": "snapdock", "name": "SnapDock", "args": ("/usr/share/snapdock/shell",), "progs": ("snapdock",),
+     "file": ("XDG_CONFIG_HOME", ".config", "snapdock/settings.json"), "lock": ".lock", "id": "com.omarchystore.store",
+     "get": _snap_get, "put": _snap_put, "seed": "", "create": False, "note": ""},
+    {"key": "omarchy", "name": "Omarchy dock", "args": ("/usr/share/omarchy/shell",), "progs": (),
+     "file": ("XDG_CONFIG_HOME", ".config", "omarchy/shell.json"), "lock": "", "id": APP_ID,
+     "get": _oma_get, "put": _oma_put, "seed": "config/omarchy/shell.json", "create": True, "note": "it shows on floating workspaces"},
+    {"key": "nwg", "name": "nwg-dock-hyprland", "args": (), "progs": ("nwg-dock-hyprland", "nwg-dock-hyprla"),
+     "file": ("XDG_CACHE_HOME", ".cache", "nwg-dock-pinned"), "lock": "", "id": APP_ID,
+     "get": _nwg_get, "put": _nwg_put, "seed": "", "create": True, "note": "it shows after the dock redraws"},
+)
+# Docks we recognise but whose pin list we do not write (yet): named, never guessed at. Legal Desk: format not known yet.
+DOCKS_UNSUPPORTED = (("plank", "Plank"), ("latte-dock", "Latte Dock"), ("cairo-dock", "Cairo-Dock"), ("hypr-dock", "hypr-dock"),
+                     ("nwg-dock", "nwg-dock (Sway)"), ("legal-desk", "Legal Desk"), ("legaldesk", "Legal Desk"), ("legal_desk", "Legal Desk"))
+
+
+def dock_procs(proc=DOCK_PROC):
+    """argv lists of the user's own processes (read-only, bounded: 8192 processes, 4 KB each)."""
+    out, uid = [], os.getuid()
+    try: names = [n for n in os.listdir(proc) if n.isdigit()][:8192]
+    except OSError: return out
+    for n in names:
+        p = os.path.join(proc, n)
+        try:
+            if os.stat(p).st_uid != uid: continue
+            with open(os.path.join(p, "cmdline"), "rb") as f: raw = f.read(4096)
+        except OSError: continue
+        argv = [a for a in raw.decode("utf-8", "replace").split("\0") if a]
+        if argv: out.append(argv)
+    return out
+
+
+def dock_find(procs):
+    """(supported adapters found running, names of recognised docks we do not support yet)."""
+    found, unsup = [], []
+    for argv in procs:
+        prog = os.path.basename(argv[0]).lower()
+        args = [a.rstrip("/") for a in argv]
+        for a in DOCKS:
+            if a not in found and (prog in a["progs"] or any(x in args for x in a["args"])): found.append(a)
+        for prog_name, name in DOCKS_UNSUPPORTED:
+            if prog == prog_name and name not in unsup: unsup.append(name)
+    return [a for a in DOCKS if a in found], unsup
+
+
+def dock_path(a, home, env):
+    var, default, rel = a["file"]
+    base = env.get(var, "")
+    base = base if base.startswith("/") else os.path.join(home, default)
+    return os.path.join(base, rel)
+
+
+def dock_seed(a, env):
+    if not a["seed"]: return ""
+    root = env.get("OMARCHY_PATH", "")
+    root = root if root.startswith("/") and ".." not in root.split("/") else DOCK_OMARCHY
+    try:
+        with open(os.path.join(root, a["seed"]), "rb") as f: return f.read(DOCK_MAX).decode("utf-8")
+    except (OSError, UnicodeDecodeError): return ""
+
+
+def dock_check_path(path, home):
+    """'' if the pin list may be read/written, else the plain reason we refuse."""
+    uid, home_r = os.getuid(), os.path.realpath(home)
+    d = os.path.dirname(path)
+    if not os.path.isdir(d): return "its settings folder does not exist yet (open the dock once)"
+    if os.path.realpath(d) != home_r and not os.path.realpath(d).startswith(home_r + "/"): return "its pin list is outside your home folder"
+    if "/.config/hypr/" in os.path.realpath(path) + "/" or os.path.realpath(d).endswith("/.config/hypr"): return "that is the compositor config, which this app never changes"
+    if os.stat(d).st_uid != uid: return "its settings folder belongs to another user"
+    if os.path.islink(path): return "its pin list is a link to another file (a dotfiles setup?); change it there by hand"
+    if os.path.lexists(path):
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode): return "its pin list is not a regular file"
+        if st.st_uid != uid: return "its pin list belongs to another user"
+        if st.st_size > DOCK_MAX: return "its pin list is unexpectedly large"
+    return ""
+
+
+def dock_read(path):
+    with open(path, "rb") as f: return f.read(DOCK_MAX + 1).decode("utf-8")
+
+
+def dock_state(a, home, env):
+    """{'path', 'pinned': True/False/None, 'why'} — read-only."""
+    path = dock_path(a, home, env)
+    why = dock_check_path(path, home)
+    if why: return {"path": path, "pinned": None, "why": why}
+    try:
+        text = dock_read(path) if os.path.exists(path) else ""
+        if not text and not a["create"]: return {"path": path, "pinned": None, "why": "it has not saved its settings yet (open it once)"}
+        return {"path": path, "pinned": a["id"] in a["get"](text, dock_seed(a, env)), "why": ""}
+    except (OSError, ValueError) as e:
+        return {"path": path, "pinned": None, "why": f"its pin list could not be read ({type(e).__name__})"}
+
+
+def dock_write(path, data, mode):
+    """Atomic: a temp file in the same folder, fsync, the same permissions, one rename. Called only by dock_change and
+    dock_tip_seen (checked by --self-test)."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f: f.write(data); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path); tmp = None
+    finally:
+        if tmp: os.unlink(tmp)
+
+
+def dock_change(a, pin, home, env, now=None):
+    """Pin (pin=True) or unpin this app in ONE dock's own pin list. Returns (ok, plain message)."""
+    path = dock_path(a, home, env)
+    why = dock_check_path(path, home)
+    if why: return False, f"{a['name']}: not changed, {why}."
+    lk = None
+    try:
+        if a["lock"]:                                                   # the dock's own lock: never write while it writes
+            lock = os.path.join(os.path.dirname(path), a["lock"])
+            if os.path.islink(lock): return False, f"{a['name']}: not changed, its lock file is a link."
+            lk = open(lock, "ab")
+            for _ in range(20):
+                try: fcntl.flock(lk.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB); break
+                except BlockingIOError: GLib.usleep(100000)
+            else: return False, f"{a['name']} is saving its settings right now. Nothing was changed; try again in a moment."
+        exists = os.path.exists(path)
+        st0 = os.lstat(path) if exists else None
+        now = GLib.get_real_time() / 1e6 if now is None else now
+        if st0 and now - st0.st_mtime < 1.0:
+            return False, f"{a['name']} changed its pin list a moment ago. Nothing was changed; try again in a moment."
+        raw = dock_read(path) if exists else ""
+        if len(raw.encode("utf-8")) > DOCK_MAX: return False, f"{a['name']}: not changed, its pin list is unexpectedly large."
+        if not raw and not a["create"]: return False, f"{a['name']}: not changed, it has not saved its settings yet (open it once)."
+        seed = dock_seed(a, env)
+        pins = a["get"](raw, seed)
+        new = [p for p in pins if p != a["id"]] + ([a["id"]] if pin else [])
+        if pin and a["id"] in pins: return True, f"Already pinned to {a['name']}."
+        if not pin and a["id"] not in pins: return True, f"Not pinned to {a['name']}."
+        out = a["put"](raw, new, seed)
+        if a["get"](out, seed) != new: return False, f"{a['name']}: not changed, the new pin list did not read back the same."
+        mode = stat.S_IMODE(st0.st_mode) if st0 else 0o600
+        if exists: dock_write(path + DOCK_BAK, raw.encode("utf-8"), mode)
+        st1 = os.lstat(path) if os.path.lexists(path) else None          # did the dock write while we worked? then do nothing
+        if (st0 is None) != (st1 is None) or (st0 and (st0.st_mtime_ns, st0.st_size, st0.st_ino) != (st1.st_mtime_ns, st1.st_size, st1.st_ino)):
+            return False, f"{a['name']} changed its pin list while we worked. Nothing was changed; try again."
+        dock_write(path, out.encode("utf-8"), mode)
+        return True, (f"Pinned to {a['name']}" if pin else f"Unpinned from {a['name']}") + (f" ({a['note']})." if pin and a["note"] else ".")
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        return False, f"{a['name']}: not changed ({type(e).__name__})."
+    finally:
+        if lk: lk.close()                                               # closing releases the lock
+
+
+def dock_tip_path():
+    return os.path.join(CONF, "dock-tip-shown")
+
+
+def dock_tip_seen():
+    """The first-run tip is shown once: remember it (an empty file in our own config folder)."""
+    private_dir(CONF)
+    if not os.path.lexists(dock_tip_path()): dock_write(dock_tip_path(), b"", 0o600)
+
+
+def launcher_info():
+    return APP_ID, os.path.join(GLib.get_user_data_dir(), "applications", APP_ID + ".desktop")
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app, catalog):
         super().__init__(application=app, title="Omarchy Store", default_width=1380, default_height=900)
@@ -801,10 +1027,9 @@ class Window(Adw.ApplicationWindow):
             b = Gtk.Button(icon_name=icon, tooltip_text=tip); b.connect("clicked", cb); hb.pack_start(b)
         self.upd_btn = Gtk.Button(visible=False, css_classes=["suggested-action", "pill"], tooltip_text="Open Updates")
         self.upd_btn.connect("clicked", lambda *_: self.show_view("updates")); hb.pack_end(self.upd_btn)
-        menu = Gio.Menu()
-        for label, action in (("Check for updates", "win.check-update"), ("About Omarchy Store", "app.about"), ("Security model", "app.security"), ("Quit", "app.quit")):
-            menu.append(label, action)
-        hb.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        self.menu = Gio.Menu(); self.docks, self.docks_unsup, self._dock_checks = [], [], {}
+        self.dock_scan()                                                    # "Pin to dock…" only when a dock is found (1.1.14)
+        hb.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=self.menu))
         self.title_w = Adw.WindowTitle(title="Omarchy Store", subtitle="installs run in your terminal · nothing runs in the background")
         hb.set_title_widget(self.title_w); tv.add_top_bar(hb)
         self.restart_bar = Adw.Banner(revealed=False, button_label="Restart")     # 1.1.12: the app file on disk is newer than this process
@@ -823,7 +1048,117 @@ class Window(Adw.ApplicationWindow):
         self.web.load_uri(HOME_URL)
         self.upd = {"have": {}, "pending": [], "aur": [], "source": "", "store": None, "busy": False, "when": ""}
         a = Gio.SimpleAction.new("check-update", None); a.connect("activate", lambda *_: (self.show_view("updates"), self.check_updates(asked=True))); self.add_action(a)
+        a = Gio.SimpleAction.new("pin-dock", None); a.connect("activate", lambda *_: self.pin_dialog()); self.add_action(a)
+        GLib.timeout_add_seconds(4, self.dock_tip)
         self.check_updates()                                                # once, when the window opens: local package lists + the catalog copy
+
+    # --- Pin to dock (1.1.14): user-triggered only ---
+    def dock_scan(self):
+        """Which docks run now (read-only). Rebuilds the menu: "Pin to dock…" only when at least one dock is found."""
+        self.docks, self.docks_unsup = dock_find(dock_procs())
+        self.menu.remove_all()
+        items = [("Check for updates", "win.check-update")] + ([("Pin to dock…", "win.pin-dock")] if self.docks or self.docks_unsup else []) + \
+                [("About Omarchy Store", "app.about"), ("Security model", "app.security"), ("Quit", "app.quit")]
+        for label, action in items: self.menu.append(label, action)
+
+    def dock_tip(self):
+        """First run only: one tip, if a supported dock runs and this app is not pinned there. Nothing is pinned."""
+        try:
+            if os.path.lexists(dock_tip_path()) or not self.docks: return False
+            home = os.path.expanduser("~")
+            if any(dock_state(a, home, os.environ)["pinned"] for a in self.docks): return False
+            self.note("Tip: pin Omarchy Store to your dock: menu (top right) › Pin to dock…")
+            dock_tip_seen()
+        except OSError as e: log("dock tip:", e)
+        return False
+
+    def pin_dialog(self):
+        self.dock_scan()
+        home = os.path.expanduser("~")
+        st = [(a, dock_state(a, home, os.environ)) for a in self.docks]
+        for name in self.docks_unsup: log("pin to dock: not supported yet:", name)
+        for a, s in st:
+            if s["why"]: log(f"pin to dock: {a['name']}: {s['why']}")
+        ok = [(a, s) for a, s in st if s["pinned"] is not None]
+        pinned = [a for a, s in ok if s["pinned"]]; free = [a for a, s in ok if not s["pinned"]]
+        short = lambda p: p.replace(home, "~", 1)
+        notes = [f"{a['name']}: can't pin here, {s['why']}." for a, s in st if s["pinned"] is None]
+        if self.docks_unsup: notes.append("Not supported yet: " + ", ".join(self.docks_unsup) + ".")
+        d = Adw.AlertDialog(); d.set_close_response("cancel")          # Esc closes; the picker keeps its row of dock buttons
+        if len(ok) != 2: d.add_response("cancel", "Cancel")
+        if hasattr(d, "set_prefer_wide_layout"): d.set_prefer_wide_layout(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        def line(text, css=()):
+            box.append(Gtk.Label(label=text, xalign=0, wrap=True, css_classes=list(css)))
+        def link(label, cb):
+            b = Gtk.Button(label=label, halign=Gtk.Align.START); b.connect("clicked", lambda *_: (d.close(), cb())); return b
+        if not ok:
+            d.set_heading("No dock this app can pin to"); d.set_body("Right-click the app's icon in your dock and choose Pin.")
+        elif len(ok) == 1:
+            a, s = ok[0]
+            if s["pinned"]:
+                d.set_heading(f"Omarchy Store is pinned to {a['name']}"); d.set_body(f"Unpin removes it from {a['name']}'s pin list; a backup is kept.")
+                d.add_response("unpin:" + a["key"], "Unpin from dock"); d.set_response_appearance("unpin:" + a["key"], Adw.ResponseAppearance.DESTRUCTIVE)
+            else:
+                d.set_heading(f"Pin Omarchy Store to {a['name']}?"); d.set_body(f"Changes only {a['name']}'s pin list (backup kept next to it).")
+                d.add_response("pin:" + a["key"], "Pin"); d.set_response_appearance("pin:" + a["key"], Adw.ResponseAppearance.SUGGESTED); d.set_default_response("pin:" + a["key"])
+            line(short(s["path"]), ("dim-label", "monospace", "caption"))
+        else:
+            d.set_heading("Which dock do you want to pin it to?")
+            d.set_body("Only the pin list of the dock you pick is changed. A backup is kept and you can unpin later.")
+            if len(ok) == 2:
+                for a, s in ok: line(f"{a['name']}" + (" — already pinned" if s["pinned"] else "") + f"\n{short(s['path'])}", ("caption",))
+                for a, s in ok:
+                    d.add_response("pin:" + a["key"], a["name"]); d.set_response_enabled("pin:" + a["key"], not s["pinned"])
+                both = "pin:" + ",".join(a["key"] for a, _s in ok)                 # a dock that already has it just says "Already pinned"
+                d.add_response(both, "Both"); d.set_response_appearance(both, Adw.ResponseAppearance.SUGGESTED); d.set_response_enabled(both, bool(free))
+                d.set_default_response(both)
+            else:
+                checks = {}
+                for a, s in ok:
+                    c = Gtk.CheckButton(label=a["name"] + (" (already pinned)" if s["pinned"] else ""), active=bool(s["pinned"]), sensitive=not s["pinned"],
+                                        tooltip_text=short(s["path"])); checks[a["key"]] = c; box.append(c)
+                allc = Gtk.CheckButton(label="All")
+                allc.connect("toggled", lambda b: [c.set_active(b.get_active() or not c.get_sensitive()) for c in checks.values()]); box.append(allc)
+                self._dock_checks = checks
+                d.add_response("pin:?", "Pin"); d.set_response_appearance("pin:?", Adw.ResponseAppearance.SUGGESTED); d.set_default_response("pin:?")
+        for n in notes: line(n, ("dim-label", "caption"))
+        line("Another dock? Copy the launcher id and add it in that dock's own settings.", ("dim-label", "caption"))
+        row = Gtk.Box(spacing=6)
+        row.append(link("Copy launcher id", lambda: self.on_pin_response(d, "copy")))
+        if len(ok) > 1 and pinned: row.append(link("Unpin…", self.unpin_dialog))
+        box.append(row); d.set_extra_child(box)
+        d.connect("response", self.on_pin_response); d.present(self)
+
+    def on_pin_response(self, _d, r):
+        if r == "copy":
+            i, path = launcher_info()
+            self.get_clipboard().set_content(Gdk.ContentProvider.new_for_value(f"{i}\n{path}"))
+            self.note(f"Copied: {i} and {path}"); return
+        if r == "unpin:?": self.unpin_dialog(); return
+        if ":" not in r: return
+        verb, keys = r.split(":", 1)
+        if keys == "?": keys = ",".join(k for k, c in self._dock_checks.items() if c.get_active() and c.get_sensitive())
+        self.dock_apply([a for a in self.docks if a["key"] in keys.split(",")], verb == "pin")
+
+    def unpin_dialog(self):
+        home = os.path.expanduser("~")
+        pinned = [a for a in self.docks if dock_state(a, home, os.environ)["pinned"]]
+        if len(pinned) == 1: self.dock_apply(pinned, False); return
+        d = Adw.AlertDialog(heading="Unpin it from which dock?", body="Only that dock's pin list changes; a backup is kept.")
+        d.add_response("cancel", "Cancel"); d.set_close_response("cancel")
+        for a in pinned: d.add_response("unpin:" + a["key"], a["name"])
+        if len(pinned) > 1: d.add_response("unpin:" + ",".join(a["key"] for a in pinned), "All" if len(pinned) > 2 else "Both")
+        d.connect("response", self.on_pin_response); d.present(self)
+
+    def dock_apply(self, docks, pin):
+        if not docks: return
+        home = os.path.expanduser("~")
+        res = [dock_change(a, pin, home, os.environ) for a in docks]
+        for good, msg in res: log("pin to dock:", msg)
+        if all(g for g, _ in res): self.note(" ".join(m for _, m in res)); return
+        d = Adw.AlertDialog(heading="Some docks were not changed", body="\n".join(m for _, m in res))
+        d.add_response("ok", "OK"); d.present(self)
 
     def show_restart(self, v):
         self.restart_bar.set_title(f"Omarchy Store was updated to {v}. Restart to use it.")
@@ -1227,6 +1562,7 @@ class App(Adw.Application):
     def check_restart(self):
         v = restart_pending(); w = self.props.active_window
         if v and w: w.show_restart(v)
+        if w: w.dock_scan()                                                # a dock started since: the menu item appears
 
     def do_startup(self):
         """Runs in the primary instance only (GApplication uniqueness): a second launch never refetches the catalog."""
@@ -1253,7 +1589,9 @@ class App(Adw.Application):
                             developer_name="Kernlux Development Labs", website="https://omarchystore.com",
                             issue_url="https://omarchystore.com/contact/", license_type=Gtk.License.MIT_X11,
                             comments="The community app store for Omarchy Linux. Independent project, not affiliated with Omarchy or 37signals.\n\n"
-                                     "Pin it: right-click its icon in your dock and choose Pin / Keep in dock.")
+                                     "Pin it: right-click its icon in your dock and choose Pin / Keep in dock, or use Pin to dock… in the menu (top right) "
+                                     "when your dock is supported (SnapDock, Omarchy dock, nwg-dock-hyprland).\n\n"
+                                     f"Other docks: add the launcher id {launcher_info()[0]} (file {launcher_info()[1]}) in the dock's own settings.")
         d.present(self.props.active_window)
 
     def security(self, *_):
@@ -1264,7 +1602,8 @@ class App(Adw.Application):
             "• Only the store (omarchystore.com and www, its API worker) loads inside this window. Links you click that "
             "lead elsewhere open in your browser; nothing a page starts on its own goes anywhere.\n"
             "• The page can only ask for an install or open a link right after you click or press a key — never on its own.\n"
-            "• It writes only to ~/.config/omarchy-store and ~/.cache/omarchy-store (plus GTK's and WebKit's own caches under ~/.cache).\n\n"
+            "• It writes only to ~/.config/omarchy-store and ~/.cache/omarchy-store (plus GTK's and WebKit's own caches under ~/.cache), "
+            "and, only when you choose Pin to dock, that one dock's pin list (a backup is kept next to it).\n\n"
             "Source: the whole app is one readable Python file, omarchy-store-desktop.py. "
             "Run it with --self-test to check these claims yourself."))
         d.add_response("ok", "Got it"); d.present(self.props.active_window)
@@ -1410,8 +1749,14 @@ def self_test():
     # 1.1.4: plus exactly two read-only opens of the pacman database, inside installed_packages / repo_versions
     db_ids = {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name in ("installed_packages", "repo_versions") for n in ast.walk(fn)}
     DB_OPENS = {"open(os.path.join(local, d, 'desc'), 'rb')", "open(os.path.join(sync, f), 'rb')"}
+    # 1.1.14: Pin to dock — four audited opens: three reads (a process's cmdline, Omarchy's default pins, the pin list) and
+    # the dock's own lock file opened for append (flock only; nothing is ever written through it)
+    def fn_ids(name): return {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == name for n in ast.walk(fn)}
+    DOCK_OPENS = {"dock_procs": "open(os.path.join(p, 'cmdline'), 'rb')", "dock_seed": "open(os.path.join(root, a['seed']), 'rb')",
+                  "dock_read": "open(path, 'rb')", "dock_change": "open(lock, 'ab')"}
+    dock_open_ok = lambda n: any(id(n) in fn_ids(k) and ast.unparse(n) == v for k, v in DOCK_OPENS.items())
     bad_open = [ast.unparse(n)[:50] for f, n in calls if f == "open" and not (len(n.args) == 2 and ast.unparse(n.args[0]) == "self.path" and getattr(n.args[1], "value", "") == "rb" and not n.keywords)
-                and not (id(n) in db_ids and ast.unparse(n) in DB_OPENS) and not (id(n) in iv_ids and ast.unparse(n) == "open(path, 'rb')")]
+                and not (id(n) in db_ids and ast.unparse(n) in DB_OPENS) and not (id(n) in iv_ids and ast.unparse(n) == "open(path, 'rb')") and not dock_open_ok(n)]
     tar_refs = [(f, n) for f, n in refs if f.split(".")[0] in ("tarfile", "gzip", "io") or f.endswith((".extract", ".extractall"))]
     tar_ok = all(id(n) in db_ids for _, n in tar_refs) and not any(f.endswith((".extract", ".extractall")) for f, _ in tar_refs) \
         and sorted({f for f, _ in tar_refs}) == ["gzip", "gzip.decompress", "io", "io.BytesIO", "tarfile", "tarfile.TarError", "tarfile.open"]
@@ -1445,7 +1790,7 @@ def self_test():
     refresh_ids = {id(n) for fn in nodes if isinstance(fn, ast.FunctionDef) and fn.name == "_refresh" for n in ast.walk(fn)}
     net_refs = [(f, n) for f, n in refs if f in ("urllib.request.build_opener", "urllib.request.Request", "opener.open", "opener")]
     net_pinned = sorted(f for f, _ in net_refs) == ["opener", "opener", "opener.open", "urllib.request.Request", "urllib.request.build_opener"] and all(id(n) in refresh_ids for _, n in net_refs)
-    ALLOWED_IMPORTS = {"gzip", "io", "json", "os", "re", "shlex", "shutil", "socket", "subprocess", "sys", "tarfile", "tempfile", "urllib.parse", "urllib.request", "gi", "gi.repository"}
+    ALLOWED_IMPORTS = {"fcntl", "gzip", "io", "json", "os", "re", "shlex", "shutil", "socket", "stat", "subprocess", "sys", "tarfile", "tempfile", "urllib.parse", "urllib.request", "gi", "gi.repository"}
     ask_ids = {id(n) for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "hypr_ask" for n in ast.walk(fn)}
     sock_refs = [(f, n) for f, n in refs if f.startswith("socket")]
     sock_ok = bool(sock_refs) and all(id(n) in ask_ids for _, n in sock_refs) and sorted({f for f, _ in sock_refs}) == ["socket", "socket.AF_UNIX", "socket.SOCK_STREAM", "socket.socket"]
@@ -1468,7 +1813,8 @@ def self_test():
     strs += ["".join(v.value if isinstance(v, ast.Constant) else (v.value.value if isinstance(v, ast.FormattedValue) and isinstance(v.value, ast.Constant) and isinstance(v.value.value, str) else "")
                      for v in n.values) for n in nodes if isinstance(n, ast.JoinedStr)]
     priv = [x for x in strs if re.search(r"\b(sudo|pkexec|doas|run0|polkit|NOPASSWD|sudoers|systemd|systemctl|setuid|setgid)\b", x)]
-    syspath = [x for x in strs if re.match(r"/(bin|sbin|lib|lib32|lib64|etc|usr|var|tmp|dev|boot|opt|root|srv|proc|sys|run|home|mnt|media)(/|$)", x) and x != "/var/lib/pacman"]
+    syspath = [x for x in strs if re.match(r"/(bin|sbin|lib|lib32|lib64|etc|usr|var|tmp|dev|boot|opt|root|srv|proc|sys|run|home|mnt|media)(/|$)", x)
+               and x not in ("/var/lib/pacman", DOCK_PROC, DOCK_OMARCHY) and x not in {y for a in DOCKS for y in a["args"]}]
     # 1.1.4: the ONE allowed fetch word is the curl inside update_command (the line the user's terminal shows for an app update)
     upd_fn = next(fn for fn in tree.body if isinstance(fn, ast.FunctionDef) and fn.name == "update_command")
     upd_strs = set(consts(update_command.__code__, [])) | {"".join(v.value if isinstance(v, ast.Constant) else "" for v in n.values) for n in ast.walk(upd_fn) if isinstance(n, ast.JoinedStr)}
@@ -1581,7 +1927,28 @@ def self_test():
     writers = sorted(f for f, _ in refs if f in ("tempfile.mkstemp", "os.replace", "os.makedirs", "os.chmod", "os.fdopen", "os.unlink", "os.fsync"))
     assigns = {t.id: ast.unparse(n.value) for n in tree.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
     private_args = sorted(ast.unparse(n.args[0]) for f, n in calls if f == "private_dir")
-    mkstemp_in_cache = all(any(k.arg == "dir" and getattr(k.value, "id", "") == "CACHE" for k in n.keywords) for f, n in calls if f == "tempfile.mkstemp")
+    dw_ids = fn_ids("dock_write")
+    mkstemp_in_cache = all(any(k.arg == "dir" and getattr(k.value, "id", "") == "CACHE" for k in n.keywords) or
+                           (id(n) in dw_ids and any(k.arg == "dir" and ast.unparse(k.value) == "os.path.dirname(path)" for k in n.keywords))
+                           for f, n in calls if f == "tempfile.mkstemp")
+    # 1.1.14: every pin-list write goes through dock_write, called only from dock_change (backup + new list) and dock_tip_seen;
+    # the lock is only flocked inside dock_change; no adapter points at the compositor config; adapters round-trip exactly
+    dw_calls = [n for f, n in calls if f == "dock_write"]
+    fcntl_refs = [n for f, n in refs if f.startswith("fcntl")]
+    S_SNAP = '{\n  "version": 2,\n  "pins": [\n    "foot"\n  ],\n  "iconSize": 48\n}\n'
+    S_OMA_DEF = '{"dock": {"position": "bottom", "pinned": ["chromium", "foot"]}}'
+    dock_ok = (len(dw_calls) == 3 and sum(1 for n in dw_calls if id(n) in fn_ids("dock_change")) == 2 and sum(1 for n in dw_calls if id(n) in fn_ids("dock_tip_seen")) == 1
+               and fcntl_refs and all(id(n) in fn_ids("dock_change") for n in fcntl_refs)
+               and all(".config/hypr" not in "/".join(a["file"][1:]) and "hypr/" not in a["file"][2] and ".." not in a["file"][2].split("/") for a in DOCKS)
+               and _snap_put(S_SNAP, ["foot", "com.omarchystore.store"]) == S_SNAP.replace('"foot"\n', '"foot",\n    "com.omarchystore.store"\n')
+               and _snap_get(_snap_put(S_SNAP, [])) == []
+               and _oma_get("", S_OMA_DEF) == ["chromium", "foot"] and _oma_get('{"bar": {}}', S_OMA_DEF) == ["chromium", "foot"]
+               and _oma_get(_oma_put('{"bar": {}}', ["chromium", "foot", APP_ID], S_OMA_DEF)) == ["chromium", "foot", APP_ID]
+               and json.loads(_oma_put('{"bar": {"x": 1}}', [APP_ID], S_OMA_DEF))["bar"] == {"x": 1}
+               and _nwg_put("a\n\nb\n", _nwg_get("a\n\nb\n") + [APP_ID]) == "a\nb\n" + APP_ID + "\n"
+               and "Legal Desk" in {n for _, n in DOCKS_UNSUPPORTED}
+               and dock_find([["quickshell", "-n", "-p", "/usr/share/snapdock/shell"], ["quickshell", "-p", "/usr/share/omarchy/shell/"], ["/usr/bin/plank"]])
+                   == ([DOCKS[0], DOCKS[1]], ["Plank"]) and dock_find([["bash"]]) == ([], []))
     checks += [
         (len(selftests) == 1 and all(id(n) in main_ids for f, n in refs if f == "self_test"), "exactly one self_test, called only from the __main__ block"),
         (not forbidden_hits, f"no eval/exec/getattr/import tricks, os.system/exec/spawn/fork/setuid, Gio.Subprocess/AppInfo, GLib.spawn, socket/ctypes/pty, raw os writes, shutil/tempfile beyond which/mkstemp, urlopen/urlretrieve {forbidden_hits}"),
@@ -1604,11 +1971,14 @@ def self_test():
         (not HYPR_ADDR_RE.fullmatch('0x1" }) hl.exec_cmd("x') and not HYPR_WS_RE.fullmatch("1\") ") and HYPR_ADDR_RE.fullmatch("0x55a4fbb251c0"),
          "compositor address/workspace patterns refuse anything that could close a quote"),
         (not env_writes, f"the environment is never modified (no os.putenv / os.environ writes) {env_writes}"),
-        (writers == ["os.chmod", "os.fdopen", "os.fsync", "os.makedirs", "os.replace", "os.unlink", "tempfile.mkstemp"] and {"os.makedirs", "os.chmod"} <= calls_in("private_dir")
-         and {"tempfile.mkstemp", "os.fdopen", "os.replace", "os.unlink", "os.fsync"} <= calls_in("_refresh"), f"file-writing calls exist only in private_dir and Catalog._refresh {writers}"),
+        (writers == ["os.chmod", "os.chmod", "os.fdopen", "os.fdopen", "os.fsync", "os.fsync", "os.makedirs", "os.replace", "os.replace", "os.unlink", "os.unlink", "tempfile.mkstemp", "tempfile.mkstemp"]
+         and {"os.makedirs", "os.chmod"} <= calls_in("private_dir") and {"tempfile.mkstemp", "os.fdopen", "os.replace", "os.unlink", "os.fsync"} <= calls_in("_refresh")
+         and {"tempfile.mkstemp", "os.fdopen", "os.replace", "os.unlink", "os.fsync", "os.chmod"} <= calls_in("dock_write"),
+         f"file-writing calls exist only in private_dir, Catalog._refresh and dock_write {writers}"),
+        (dock_ok, "Pin to dock: writes only through dock_write (from dock_change and the tip marker), flock only in dock_change, no adapter near the compositor config, every adapter round-trips its own format exactly, unknown docks (Legal Desk) are named, never written"),
         (mkstemp_in_cache, "the catalog temp file is always created inside CACHE"),
         (assigns.get("CONF") == "os.path.join(GLib.get_user_config_dir(), 'omarchy-store')" and assigns.get("CACHE") == "os.path.join(GLib.get_user_cache_dir(), 'omarchy-store')"
-         and private_args == ["CACHE", "CONF"], "the only directories ever created are the XDG config/cache dirs + 'omarchy-store'"),
+         and sorted(set(private_args)) == ["CACHE", "CONF"], "the only directories ever created are the XDG config/cache dirs + 'omarchy-store'"),
         (assigns.get("STORE_HOSTS") == "('omarchystore.com', 'www.omarchystore.com')"
          and assigns.get("WEBVIEW_HOSTS") == "STORE_HOSTS + ('omarchy-store-backend.omarchystore.workers.dev',)" and assigns.get("DEFAULT_HOME") == "'https://omarchystore.com/'",
          "the host allow-lists and the default home are exactly the three named hosts"),
