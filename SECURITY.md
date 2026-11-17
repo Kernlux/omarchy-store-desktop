@@ -207,7 +207,7 @@ nothing behind.
 ## Verify it yourself
 `python3 -I omarchy-store-desktop.py --self-test` (114 checks, no display, no network: the command allow-list,
 the URL and message validation, the terminal script, and a static audit of this file — every name, call, import,
-string, bytes and f-string in the app body) and `python3 -m pytest tests/` (291 tests, `python-pytest` is a
+string, bytes and f-string in the app body) and `python3 -m pytest tests/` (284 tests, `python-pytest` is a
 development tool, not a runtime dependency; they include negative tests that plant known audit evasions in a copy of
 the file and require the self-test to fail). The packaging and no-hook facts are asserted by the tests, not by the
 self-test.
